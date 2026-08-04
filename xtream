@@ -1,0 +1,1330 @@
+#!/usr/bin/env bash
+# xtream — check an Xtream Codes IPTV line and search / play its channels.
+#
+# Credentials come from ~/.config/xtream/<profile>.conf (see --help), so nothing
+# secret ever lands in this repo.
+
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/xtream"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/xtream"
+CACHE_TTL="${XTREAM_CACHE_TTL:-21600}" # 6h
+
+# Big panels answer get_vod_streams with tens of megabytes, so the overall
+# transfer budget has to be generous. Stalls are caught by the speed floor
+# below, not by a short wall-clock cap.
+CONNECT_TIMEOUT="${XTREAM_CONNECT_TIMEOUT:-15}"
+TIMEOUT="${XTREAM_TIMEOUT:-300}"
+BATCH_CONCURRENCY="${XTREAM_BATCH_CONCURRENCY:-5}"
+BATCH_CONNECT_TIMEOUT="${XTREAM_BATCH_CONNECT_TIMEOUT:-8}"
+SPEED_LIMIT="${XTREAM_SPEED_LIMIT:-1024}" # bytes/sec …
+SPEED_TIME="${XTREAM_SPEED_TIME:-30}"     # … sustained for this long = dead
+PROBE_TIMEOUT="${XTREAM_PROBE_TIMEOUT:-20}"
+
+PROFILE="${XTREAM_PROFILE:-default}"
+KIND="live"
+REFRESH=""
+STATS=""
+STALKER=""        # set when the active line is a Stalker/Ministra portal
+STALKER_PORTAL=""
+STALKER_MAC=""
+
+if [[ -t 1 ]]; then
+  R=$'\033[31m' G=$'\033[32m' Y=$'\033[33m' B=$'\033[34m' D=$'\033[2m' N=$'\033[0m'
+else
+  R="" G="" Y="" B="" D="" N=""
+fi
+
+# die() often fires inside $(...), where a bare `exit` would only kill the
+# subshell and let the caller carry on with empty output. Signal the top shell.
+TOP_PID=$$
+trap 'exit 1' TERM
+
+die() {
+  echo "${R}xtream:${N} $*" >&2
+  kill -s TERM "$TOP_PID" 2>/dev/null
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+xtream — check an Xtream Codes IPTV line and search / play its channels.
+
+USAGE
+  xtream <PLAYLIST-URL> [command]        # test a playlist you were just sent
+  xtream [options] <command> [args]      # use a saved profile
+
+TESTING A NEW PLAYLIST
+  Paste the URL a provider gave you — get.php, player_api.php or a stream link.
+  Credentials are read straight out of it, no setup:
+
+    xtream 'http://host:8080/get.php?username=U&password=P&type=m3u_plus'
+
+  With no command that prints a verdict (status + counts + categories). Any
+  command works too, and `save` keeps the line for later:
+
+    xtream 'http://host:8080/get.php?username=U&password=P' search espn
+    xtream 'http://host:8080/get.php?username=U&password=P' save myprovider
+
+  Quote the URL — & would background the command otherwise. Note the password
+  lands in shell history; in zsh a leading space keeps it out (HIST_IGNORE_SPACE).
+
+TESTING A SHARED DUMP (many lines at once)
+  IPTV lines get passed around as a base64 paste code (often a paste.sh link).
+  Hand that code — or the paste.sh URL — straight in and it decodes, decrypts,
+  and runs your command against every line:
+
+    xtream <base64-code>                      # status of every line
+    xtream <base64-code> search chile         # search each active line
+    xtream <base64-code> check 12345
+
+  Lines on a shared server hand out the same catalogue, so identical results
+  are collapsed to "same as <first line>". Only active lines get the command.
+
+  Add --stats to the status overview for per-line live/movie counts:
+
+    xtream <base64-code> --stats
+
+  Stalker/Ministra portals (MAC-based, no username/password) are handled
+  too — a paste with "Panel ➤ … / Mac ➤ …" blocks expands like any other,
+  and status/search/check/url/counts all work per MAC.
+
+COMMANDS
+  quick               Status + counts + categories (default for a bare URL)
+  batch <code> [cmd]  Expand a base64/paste.sh dump and run cmd on each line
+  status              Account status: active/expired, expiry date, connections
+  search [QUERY]      List channels matching QUERY (case-insensitive regex).
+                      No QUERY lists everything.
+  categories          List categories for the current type
+  url <ID|QUERY>      Print the direct stream URL
+  play [QUERY]        Pick a channel (fzf) and play it in mpv
+  check <ID|QUERY>    Probe the stream with ffprobe — is it really alive?
+  counts              How many live channels / movies / series the line carries
+  save [NAME]         Save the current line as profile NAME (default: "default")
+  raw <ACTION>        Dump raw player_api.php JSON for ACTION (e.g. get_series)
+
+OPTIONS
+  -u, --url URL       Playlist URL to use instead of a saved profile
+  -p, --profile NAME  Credential profile (default: $XTREAM_PROFILE or "default")
+  -t, --type KIND     live (default) | vod | series
+  -r, --refresh       Bypass the cached channel list
+  -v, --stats         Batch status: add per-line live/movie counts (slower)
+  -f, --force         Let `save` overwrite an existing profile
+  -h, --help          This text
+
+CONFIG
+  Create ~/.config/xtream/default.conf (chmod 600):
+
+    XTREAM_HOST=http://line.example.com:8080
+    XTREAM_USER=myusername
+    XTREAM_PASS=mypassword
+
+  Add more providers as ~/.config/xtream/<name>.conf and reach them with
+  `xtream -p <name> ...`. Any value may be a 1Password secret reference and is
+  resolved with `op read`, e.g.:
+
+    XTREAM_PASS=op://Private/IPTV/password
+
+  Environment variables of the same name override the file.
+
+EXAMPLES
+  xtream 'http://host:8080/get.php?username=U&password=P'   # is this any good?
+  xtream status
+  xtream search 'espn|fox sports'
+  xtream play cnn
+  xtream check 12345
+  xtream -t vod search dune
+  xtream -p other status
+EOF
+}
+
+# ------------------------------------------------------------------ config ---
+
+# Pull host/username/password out of any Xtream URL a provider hands you:
+#   http://host:8080/get.php?username=U&password=P&type=m3u_plus
+#   http://host:8080/player_api.php?username=U&password=P
+#   http://host:8080/live/U/P/12345.ts
+parse_playlist_url() {
+  local url="$1"
+  [[ $url == http://* || $url == https://* ]] || url="http://$url"
+
+  local scheme="${url%%://*}"
+  local rest="${url#*://}"
+  local hostport="${rest%%/*}"
+  local tail="${rest#"$hostport"}"
+  local u="" p="" kv
+
+  [[ -n $hostport ]] || die "no host in that URL"
+
+  if [[ $tail == *\?* ]]; then
+    local IFS='&'
+    for kv in ${tail#*\?}; do
+      case "$kv" in
+      username=*) u="${kv#username=}" ;;
+      password=*) p="${kv#password=}" ;;
+      esac
+    done
+  fi
+
+  if [[ -z $u && $tail =~ ^/(live|movie|series)/([^/]+)/([^/]+)/ ]]; then
+    u="${BASH_REMATCH[2]}"
+    p="${BASH_REMATCH[3]}"
+  fi
+
+  [[ -n $u && -n $p ]] || die "no username/password in that URL — pass a get.php or player_api.php link"
+
+  XTREAM_HOST="$scheme://$hostport"
+  XTREAM_USER="$(urldecode "$u")"
+  XTREAM_PASS="$(urldecode "$p")"
+}
+
+urldecode() {
+  local s="$1"
+
+  # Nothing to decode: pass through untouched rather than let printf %b eat a
+  # backslash that is genuinely part of the password.
+  if [[ $s != *%* && $s != *+* ]]; then
+    printf '%s' "$s"
+    return
+  fi
+
+  s="${s//+/ }"
+  s="${s//\\/\\\\}"
+  printf '%b' "${s//%/\\x}"
+}
+
+# --- batch: decode a shared dump into a list of Xtream URLs ----------------
+#
+# IPTV lines get passed around as a base64-encoded paste.sh link. Decode it,
+# pull the ciphertext, decrypt it (paste.sh encrypts client-side with the key
+# in the URL fragment), and scrape every get.php/player_api URL out.
+
+# Base64 that decodes to an http(s) URL → the decoded URL; anything else → "".
+maybe_base64_url() {
+  local s="$1" dec
+  [[ $s =~ ^[A-Za-z0-9+/=_-]+$ && ${#s} -ge 16 ]] || return 1
+  dec="$(printf '%s' "$s" | base64 -d 2>/dev/null)" || return 1
+  [[ $dec == http://* || $dec == https://* ]] || return 1
+  printf '%s' "$dec"
+}
+
+# Decrypt a paste.sh URL (base#fragment) to plaintext on stdout.
+# Mirrors paste.sh's own scheme: AES-256-CBC, key/IV via OpenSSL-style PBKDF2
+# with SHA-512 and one iteration, password = id + serverkey + hash + origin.
+# serverkey is empty for the public pastes these dumps use.
+fetch_pastesh() {
+  need openssl
+  need python3
+  local url="$1"
+  local base="${url%%#*}" hash="${url#*#}"
+  local id="${base##*/}"
+  [[ -n $id && $hash != "$url" ]] || die "not a decryptable paste.sh URL (need the #key part)"
+
+  local ct
+  ct="$(curl -fsS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$TIMEOUT" "$base.txt")" \
+    || die "could not fetch paste $id"
+
+  XT_CT="$ct" XT_ID="$id" XT_HASH="$hash" python3 - <<'PY' || die "paste decryption failed — wrong key, or not a v3 paste"
+import base64, hashlib, os, subprocess, sys
+
+blob = base64.b64decode("".join(os.environ["XT_CT"].split()))
+if blob[:8] != b"Salted__":
+    sys.exit("no OpenSSL salt header")
+salt, data = blob[8:16], blob[16:]
+
+pw = (os.environ["XT_ID"] + "" + os.environ["XT_HASH"] + "https://paste.sh").encode()
+kd = hashlib.pbkdf2_hmac("sha512", pw, salt, 1, 48)
+key, iv = kd[:32].hex(), kd[32:48].hex()
+
+p = subprocess.run(
+    ["openssl", "enc", "-d", "-aes-256-cbc", "-K", key, "-iv", iv],
+    input=data, capture_output=True)
+if p.returncode:
+    sys.exit(p.stderr.decode()[:200] or "openssl failed")
+sys.stdout.buffer.write(p.stdout)
+PY
+}
+
+# --- Stalker / Ministra portal client ---------------------------------------
+#
+# A different protocol from Xtream: the MAC is the credential, auth is a
+# handshake→profile→bearer-token dance, and channels come with a per-item
+# play URL. Runs the embedded Python client below.
+#   stalker_run <command> [args]   (command: status|counts|search|url)
+stalker_run() {
+  need python3
+  local refresh_env=""
+  [[ -n $REFRESH ]] && refresh_env=1
+  XTREAM_REFRESH="$refresh_env" \
+    python3 - "$STALKER_PORTAL" "$STALKER_MAC" "$CACHE_DIR" "$@" <<'PY'
+import sys, os, re, json, time, urllib.request, urllib.parse
+
+UA = ("Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 "
+      "(KHTML, like Gecko) MAG200 stbapp ver: 4 rev: 250 Safari/533.3")
+CTO = int(os.environ.get("XTREAM_CONNECT_TIMEOUT", "15"))
+
+
+def die(m):
+    sys.stderr.write("xtream: " + m + "\n"); sys.exit(1)
+
+
+class Portal:
+    def __init__(self, portal, mac):
+        m = re.match(r"(https?://[^/]+)", portal)
+        if not m:
+            die("bad portal URL: " + portal)
+        self.origin = m.group(1)
+        self.ref = portal if portal.endswith("/") else portal + "/"
+        self.mac = mac
+        self.token = None
+
+    def _call(self, params):
+        url = self.origin + "/portal.php?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", UA)
+        req.add_header("Referer", self.ref)
+        req.add_header("X-User-Agent", "Model: MAG250; Link: WiFi")
+        req.add_header("Cookie", "mac=%s; stb_lang=en; timezone=Europe/London"
+                       % urllib.parse.quote(self.mac))
+        if self.token:
+            req.add_header("Authorization", "Bearer " + self.token)
+        try:
+            with urllib.request.urlopen(req, timeout=max(CTO, 20)) as r:
+                raw = r.read().decode("utf-8", "replace")
+        except Exception as e:
+            die("portal request failed: %s" % e)
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return {}
+
+    def auth(self):
+        j = self._call({"type": "stb", "action": "handshake",
+                        "token": "", "JsHttpRequest": "1-xml"})
+        self.token = (j.get("js") or {}).get("token")
+        if not self.token:
+            die("handshake failed — portal rejected the MAC or is down")
+        self._call({"type": "stb", "action": "get_profile",
+                    "hd": "1", "JsHttpRequest": "1-xml"})
+
+    def account(self):
+        return (self._call({"type": "account_info", "action": "get_main_info",
+                            "JsHttpRequest": "1-xml"}).get("js")) or {}
+
+    def channels(self, cachedir):
+        key = re.sub(r"[^0-9A-Za-z]", "_", self.origin + "_" + self.mac)
+        cf = os.path.join(cachedir, "stalker." + key + ".json")
+        ttl = int(os.environ.get("XTREAM_CACHE_TTL", "21600"))
+        if not os.environ.get("XTREAM_REFRESH") and os.path.exists(cf):
+            if time.time() - os.path.getmtime(cf) < ttl and os.path.getsize(cf) > 2:
+                with open(cf) as fh:
+                    return json.load(fh)
+        data = (self._call({"type": "itv", "action": "get_all_channels",
+                            "JsHttpRequest": "1-xml"}).get("js") or {}).get("data") or []
+        os.makedirs(cachedir, exist_ok=True)
+        with open(cf + ".tmp", "w") as fh:
+            json.dump(data, fh)
+        os.replace(cf + ".tmp", cf)
+        return data
+
+
+def parse_expiry(phone):
+    if not phone:
+        return None, None
+    for fmt in ("%B %d, %Y, %I:%M %p", "%B %d, %Y", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            t = time.strptime(phone.strip(), fmt)
+            return time.strftime("%Y-%m-%d %H:%M", t), int((time.mktime(t) - time.time()) / 86400)
+        except ValueError:
+            continue
+    return phone, None
+
+
+def stream_url(cmd):
+    return cmd.split(" ", 1)[1] if " " in cmd else cmd
+
+
+portal, mac, cachedir, cmd = sys.argv[1:5]
+args = sys.argv[5:]
+p = Portal(portal, mac)
+
+if cmd == "status":
+    p.auth()
+    exp, days = parse_expiry(p.account().get("phone"))
+    print("server       " + p.origin)
+    print("mac          " + mac)
+    print("status       " + ("Active" if (days is None or days >= 0) else "Expired"))
+    if exp:
+        print("expires      " + exp + ("" if days is None else "  (%d days)" % days))
+    print("connections  -")
+elif cmd == "counts":
+    p.auth()
+    print("live    %d" % len(p.channels(cachedir)))
+    print("movies  ?")
+    print("series  ?")
+elif cmd in ("search", "url"):
+    p.auth()
+    ch = p.channels(cachedir)
+    if cmd == "search":
+        q = args[0] if args else ""
+        rx = re.compile(q, re.I) if q else None
+        n = 0
+        for c in ch:
+            if rx is None or rx.search(c.get("name", "")):
+                print("%s\t%s\t%s" % (c.get("id"), c.get("name", ""), "-")); n += 1
+        if n == 0:
+            die("no live channel matches '%s'" % q)
+    else:
+        if not args:
+            die("usage: url <id|query>")
+        arg = args[0]
+        hit = next((c for c in ch if str(c.get("id")) == arg), None) if arg.isdigit() else None
+        if hit is None:
+            rx = re.compile(re.escape(arg), re.I)
+            ms = [c for c in ch if rx.search(c.get("name", ""))]
+            if len(ms) == 1:
+                hit = ms[0]
+            elif not ms:
+                die("no channel matches '%s'" % arg)
+            else:
+                sys.stderr.write("%d matches for '%s' — narrow it down or pass an id:\n" % (len(ms), arg))
+                for c in ms[:25]:
+                    sys.stderr.write("  %s\t%s\n" % (c.get("id"), c.get("name", "")))
+                sys.exit(1)
+        link = p._call({"type": "itv", "action": "create_link",
+                        "cmd": hit["cmd"], "JsHttpRequest": "1-xml"})
+        url = stream_url((link.get("js") or {}).get("cmd") or "")
+        if not url or "stream=&" in url:
+            url = stream_url(hit["cmd"])
+        print(url)
+else:
+    die("unknown stalker command: " + cmd)
+PY
+}
+
+# Emit every distinct Xtream line URL found in text on stdin. Handles two
+# shapes these dumps come in:
+#   1. full get.php / player_api.php URLs, one per line
+#   2. a bare host line ("http://host:80") followed by a "user  pass  Expires"
+#      table — reconstruct a get.php URL from each row
+extract_xtream_urls() {
+  awk '
+    function emit(u) { if (!seen[u]++) print u }
+    { line = $0; sub(/\r$/, "", line); sub(/[ \t]+$/, "", line); sub(/^[ \t]+/, "", line) }
+
+    # (1) inline get.php / player_api.php URLs, anywhere on the line
+    {
+      s = line
+      while (match(s, /https?:\/\/[^[:space:]"'"'"'<>]*(get\.php|player_api\.php)[^[:space:]"'"'"'<>]*/)) {
+        emit(substr(s, RSTART, RLENGTH))
+        s = substr(s, RSTART + RLENGTH)
+      }
+    }
+
+    # (3) Stalker portals: "Panel ➤ http://host/c/" then "Mac ➤ 00:1A:..."
+    #     emitted as a stalker:<portal>#<mac> token the loader recognises.
+    line ~ /Panel/ && match(line, /https?:\/\/[^[:space:]]+/) {
+      sp = substr(line, RSTART, RLENGTH); sub(/\/+$/, "", sp); stalker_portal = sp; next
+    }
+    match(line, /([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}/) {
+      if (stalker_portal != "") emit("stalker:" stalker_portal "#" substr(line, RSTART, RLENGTH))
+      next
+    }
+
+    # a bare host URL sets the context for the table rows beneath it
+    line ~ /^https?:\/\/[^[:space:]]+$/ && line !~ /(get\.php|player_api\.php)/ {
+      host = line; sub(/\/+$/, "", host); next
+    }
+
+    # (2) "user  pass  [Expires…]" rows under a host — fields split on 2+ spaces
+    host != "" {
+      n = split(line, f, /[ \t][ \t]+/)
+      if (n < 2) next
+      u = f[1]; p = f[2]
+      # skip the header row and anything that is not a plain credential token
+      lu = tolower(u); lp = tolower(p)
+      if (lu ~ /^(usr|user|username|login|line)$/ || lp ~ /^(pw|pass|password)$/) next
+      if (u !~ /^[A-Za-z0-9._@+-]{2,}$/ || p !~ /^[A-Za-z0-9._@+-]{2,}$/) next
+      emit(host "/get.php?username=" u "&password=" p "&type=m3u_plus")
+    }
+  '
+}
+
+# Turn a batch input (base64, paste.sh URL, or raw text URL) into a URL list.
+resolve_batch_urls() {
+  local input="$1" decoded text
+
+  decoded="$(maybe_base64_url "$input")" && input="$decoded"
+
+  case "$input" in
+  *paste.sh/*)
+    text="$(fetch_pastesh "$input")" || exit 1
+    printf '%s\n' "$text" | extract_xtream_urls
+    ;;
+  stalker:*)
+    # A single Stalker portal token handed in directly.
+    printf '%s\n' "$input"
+    ;;
+  http://*get.php* | https://*get.php* | http://*player_api* | https://*player_api*)
+    # A single line handed in directly.
+    printf '%s\n' "$input"
+    ;;
+  http://* | https://*)
+    # Some other page/paste — fetch and scrape whatever Xtream URLs it holds.
+    text="$(curl -fsS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$TIMEOUT" "$input")" \
+      || die "could not fetch $input"
+    printf '%s\n' "$text" | extract_xtream_urls
+    ;;
+  *)
+    die "don't know how to expand that — pass a base64 paste code, a paste.sh URL, or a get.php URL"
+    ;;
+  esac
+}
+
+# Run one batch line to stdout. Reads sub/fwd/STATS from the caller (cmd_batch)
+# via dynamic scope. With --stats on a status run, it also fetches counts so
+# the overview can show channel totals.
+batch_run_line() {
+  local url="$1"; shift
+  if [[ $sub == status && -n ${STATS:-} ]]; then
+    "$SELF" ${fwd[@]+"${fwd[@]}"} -u "$url" status
+    "$SELF" ${fwd[@]+"${fwd[@]}"} -u "$url" counts
+  else
+    "$SELF" ${fwd[@]+"${fwd[@]}"} -u "$url" "$sub" "$@"
+  fi
+}
+
+# A short label for a batch line: the Xtream username, or the MAC for a
+# Stalker portal token.
+batch_label() {
+  case "$1" in
+  stalker:*) printf '%s' "${1##*#}" ;;
+  *) sed -n 's/.*username=\([^&]*\).*/\1/p' <<<"$1" ;;
+  esac
+}
+
+cmd_batch() {
+  [[ -n ${1:-} ]] || die "usage: xtream batch <base64-code|paste.sh URL> [command] [args]"
+  local input="$1"
+  shift
+
+  # Flags typed after the code (e.g. `xtream '<code>' --stats`) land here, not
+  # in the main option loop, so consume any that precede the sub-command.
+  while [[ ${1:-} == -* ]]; do
+    case "$1" in
+    -v | --stats) STATS=1; shift ;;
+    -r | --refresh) REFRESH=1; shift ;;
+    -t | --type) KIND="${2:?--type needs live|vod|series}"; shift 2 ;;
+    -c | --connect-timeout)
+      CONNECT_TIMEOUT="${2:?--connect-timeout needs seconds}"
+      BATCH_CONNECT_TIMEOUT="$2"; shift 2 ;;
+    *) die "unknown batch option '$1' (try --help)" ;;
+    esac
+  done
+
+  local sub="${1:-status}"
+  [[ $# -gt 0 ]] && shift
+
+  local urls=()
+  local line
+  while IFS= read -r line; do [[ -n $line ]] && urls+=("$line"); done < <(resolve_batch_urls "$input")
+
+  ((${#urls[@]})) || die "no Xtream lines found in that input"
+
+  # Pass our own -t/-r flags through to each sub-invocation. Batch lines fail
+  # fast on a dead host — no point waiting the full single-line connect budget.
+  local -a fwd=(-c "$BATCH_CONNECT_TIMEOUT")
+  [[ $KIND != live ]] && fwd+=(-t "$KIND")
+  [[ -n $REFRESH ]] && fwd+=(-r)
+
+  echo "${D}${#urls[@]} line(s) · running '$sub' in parallel${N}"
+
+  # Run every line concurrently into its own temp file. The lines are
+  # independent, so wall-clock collapses to the slowest single line instead of
+  # the sum. Cap the fan-out so a huge dump doesn't open hundreds of sockets.
+  local tmp
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/xtream-batch.XXXXXX")"
+  local i=0 u running=0
+  for u in "${urls[@]}"; do
+    i=$((i + 1))
+    ( batch_run_line "$u" "$@" >"$tmp/$i.out" 2>&1 || true ) &
+    running=$((running + 1))
+    if ((running >= BATCH_CONCURRENCY)); then wait; running=0; fi
+  done
+  wait
+
+  # Servers under a burst of parallel requests hand back transient rejections
+  # (503/511/timeouts). Retry only those, one at a time, so a rate-limit
+  # doesn't get mistaken for "line dead" or "channel absent".
+  local retried=0
+  for i in $(seq 1 "${#urls[@]}"); do
+    if grep -qE 'curl: \(|request failed|server rejected|timed out' "$tmp/$i.out" 2>/dev/null; then
+      batch_run_line "${urls[$((i - 1))]}" "$@" >"$tmp/$i.out" 2>&1 || true
+      retried=$((retried + 1))
+    fi
+  done
+  ((retried)) && echo "${D}retried $retried rate-limited line(s)${N}"
+
+  local out sig match n user host
+
+  # status → one compact line per account; anything else → grouped results
+  # with byte-identical catalogues folded to "same as <line>".
+  if [[ $sub == status ]]; then
+    local st exp cons live movies
+    for i in $(seq 1 "${#urls[@]}"); do
+      u="${urls[$((i - 1))]}"
+      user="$(batch_label "$u")"
+      out="$(cat "$tmp/$i.out" 2>/dev/null)"
+      if ! grep -q '^status ' <<<"$out"; then
+        printf '  %2d. %-22s %s\n' "$i" "${user:-?}" "${R}unreachable/rejected${N}"
+        continue
+      fi
+      st="$(sed -n 's/^status *//p' <<<"$out" | sed 's/\x1b\[[0-9;]*m//g')"
+      exp="$(sed -n 's/^expires *//p' <<<"$out" | sed 's/  .*//')"
+      cons="$(sed -n 's/^connections *//p' <<<"$out")"
+      cons="${cons:--}"   # Stalker portals report no connection count
+      local colour="$G"
+      [[ $st == Active ]] || colour="$R"
+      if [[ -n $STATS ]]; then
+        live="$(sed -n 's/^live *//p' <<<"$out")"
+        movies="$(sed -n 's/^movies *//p' <<<"$out")"
+        printf '  %2d. %-22s %b%-8s%b exp %s  conn %-5s  live %-6s movies %s\n' \
+          "$i" "${user:-?}" "$colour" "$st" "$N" "$exp" "$cons" "${live:-?}" "${movies:-?}"
+      else
+        printf '  %2d. %-22s %b%-8s%b exp %s  conn %s\n' \
+          "$i" "${user:-?}" "$colour" "$st" "$N" "$exp" "$cons"
+      fi
+    done
+    rm -rf "$tmp"
+    return
+  fi
+
+  # counts → a compact live/movies/series table, one row per account.
+  if [[ $sub == counts ]]; then
+    local live movies series
+    for i in $(seq 1 "${#urls[@]}"); do
+      u="${urls[$((i - 1))]}"
+      user="$(batch_label "$u")"
+      out="$(cat "$tmp/$i.out" 2>/dev/null)"
+      if ! grep -q '^live ' <<<"$out"; then
+        printf '  %2d. %-22s %s\n' "$i" "${user:-?}" "${R}unreachable/rejected${N}"
+        continue
+      fi
+      live="$(sed -n 's/^live *//p' <<<"$out")"
+      movies="$(sed -n 's/^movies *//p' <<<"$out")"
+      series="$(sed -n 's/^series *//p' <<<"$out")"
+      printf '  %2d. %-22s live %-7s movies %-7s series %s\n' \
+        "$i" "${user:-?}" "$live" "$movies" "$series"
+    done
+    rm -rf "$tmp"
+    return
+  fi
+
+  # Group byte-identical results (a shared server repeats the same catalogue
+  # under every account), classify each line, and tally for the summary.
+  local -a g_sig=() g_label=() g_host=() g_out=() g_cat=() g_also=() err_labels=()
+  local n_ok=0 n_empty=0 n_err=0 cat gi k
+  for i in $(seq 1 "${#urls[@]}"); do
+    u="${urls[$((i - 1))]}"
+    user="$(batch_label "$u")"
+    host="${u#*://}"; host="${host%%/*}"
+    out="$(cat "$tmp/$i.out" 2>/dev/null)"
+    sig="$(printf '%s' "$out" | hash_text)"
+
+    if grep -qE 'curl: \(|request failed|server rejected|timed out|authentication rejected' <<<"$out"; then
+      cat=ERR; n_err=$((n_err + 1)); err_labels+=("$user")
+    elif [[ -z ${out//[[:space:]]/} ]] || grep -q 'no live channel matches' <<<"$out"; then
+      cat=EMPTY; n_empty=$((n_empty + 1))
+    else
+      cat=OK; n_ok=$((n_ok + 1))
+    fi
+
+    gi=-1
+    for k in ${g_sig[@]+"${!g_sig[@]}"}; do
+      [[ ${g_sig[$k]} == "$sig" ]] && gi=$k && break
+    done
+    if ((gi < 0)); then
+      g_sig+=("$sig"); g_label+=("$user"); g_host+=("$host")
+      g_out+=("$out"); g_cat+=("$cat"); g_also+=("")
+    else
+      g_also[$gi]="${g_also[$gi]} $user"
+    fi
+  done
+
+  local also code
+  for k in ${g_sig[@]+"${!g_sig[@]}"}; do
+    cat="${g_cat[$k]}"
+    # For search, a "no match" line is just noise — count it, don't print it.
+    [[ $sub == search && $cat == EMPTY ]] && continue
+    also="${g_also[$k]# }"
+    echo
+    case "$cat" in
+    OK)
+      echo "${B}${g_host[$k]} · ${g_label[$k]}${N}"
+      printf '%s\n' "${g_out[$k]}" | sed 's/^/  /'
+      ;;
+    EMPTY)
+      echo "${B}${g_host[$k]} · ${g_label[$k]}${N} ${D}— no match${N}"
+      ;;
+    ERR)
+      code="$(grep -oE '(error: |HTTP )[0-9]{3}' <<<"${g_out[$k]}" | grep -oE '[0-9]{3}' | head -1)"
+      echo "${B}${g_host[$k]} · ${g_label[$k]}${N} ${R}⚠ $([[ -n $code ]] && echo "HTTP $code" || echo error)${N}"
+      ;;
+    esac
+    [[ -n $also ]] && echo "  ${D}also: ${also// /, }${N}"
+  done
+
+  echo
+  echo "${D}── ${#urls[@]} lines · ${n_ok} matched · ${n_empty} no match · ${n_err} dead${N}"
+  if ((n_err)); then
+    local joined=""
+    for k in "${err_labels[@]}"; do joined="${joined:+$joined, }$k"; done
+    echo "${D}   dead: ${joined}${N}"
+  fi
+
+  rm -rf "$tmp"
+}
+
+# Ad-hoc URLs get their own cache slot so repeated tests of different
+# providers never read each other's channel lists.
+adhoc_profile_key() {
+  local raw="${XTREAM_HOST#*://}_${XTREAM_USER}"
+  # printf, not a herestring: the trailing newline would become an underscore.
+  printf 'adhoc.%s' "$(printf '%s' "$raw" | tr -c '[:alnum:]._-' '_')"
+}
+
+load_config() {
+  # An explicit URL bypasses profiles entirely — the common case here is
+  # "does this playlist someone just sent me work at all?".
+  if [[ -n ${URL_OVERRIDE:-} ]]; then
+    # Stalker portal token: stalker:<portal>#<mac>
+    if [[ $URL_OVERRIDE == stalker:* ]]; then
+      local rest="${URL_OVERRIDE#stalker:}"
+      STALKER=1
+      STALKER_PORTAL="${rest%%#*}"
+      STALKER_MAC="${rest#*#}"
+      [[ -n $STALKER_MAC && $STALKER_MAC != "$rest" ]] || die "bad stalker token (need portal#mac)"
+      PROFILE="stalker.$(printf '%s' "${STALKER_PORTAL#*://}_${STALKER_MAC}" | tr -c '[:alnum:]' '_')"
+      return
+    fi
+    parse_playlist_url "$URL_OVERRIDE"
+    XTREAM_HOST="${XTREAM_HOST%/}"
+    PROFILE="$(adhoc_profile_key)"
+    return
+  fi
+
+  local env_host="${XTREAM_HOST:-}" env_user="${XTREAM_USER:-}" env_pass="${XTREAM_PASS:-}"
+  local conf="$CONFIG_DIR/$PROFILE.conf"
+
+  if [[ -r $conf ]]; then
+    # shellcheck disable=SC1090
+    source "$conf"
+  elif [[ -z $env_host || -z $env_user || -z $env_pass ]]; then
+    die "no credentials — create $conf (see 'xtream --help')"
+  fi
+
+  # Environment wins over the file.
+  [[ -n $env_host ]] && XTREAM_HOST="$env_host"
+  [[ -n $env_user ]] && XTREAM_USER="$env_user"
+  [[ -n $env_pass ]] && XTREAM_PASS="$env_pass"
+
+  : "${XTREAM_HOST:?missing XTREAM_HOST}"
+  : "${XTREAM_USER:?missing XTREAM_USER}"
+  : "${XTREAM_PASS:?missing XTREAM_PASS}"
+
+  XTREAM_HOST="$(resolve_secret "$XTREAM_HOST")"
+  XTREAM_USER="$(resolve_secret "$XTREAM_USER")"
+  XTREAM_PASS="$(resolve_secret "$XTREAM_PASS")"
+
+  [[ $XTREAM_HOST == http://* || $XTREAM_HOST == https://* ]] || XTREAM_HOST="http://$XTREAM_HOST"
+  XTREAM_HOST="${XTREAM_HOST%/}"
+}
+
+resolve_secret() {
+  if [[ $1 == op://* ]]; then
+    command -v op >/dev/null 2>&1 || die "1Password CLI (op) not found, needed for $1"
+    op read "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed"; }
+
+# --------------------------------------------------------------------- api ---
+
+api() {
+  local action="${1:-}"
+  local -a args=(
+    --get
+    --data-urlencode "username=$XTREAM_USER"
+    --data-urlencode "password=$XTREAM_PASS"
+  )
+  [[ -n $action ]] && args+=(--data-urlencode "action=$action")
+
+  local resp rc=0
+  resp="$(curl -fsS \
+    --connect-timeout "$CONNECT_TIMEOUT" \
+    --max-time "$TIMEOUT" \
+    --speed-limit "$SPEED_LIMIT" --speed-time "$SPEED_TIME" \
+    --compressed \
+    "${args[@]}" "$XTREAM_HOST/player_api.php")" || rc=$?
+
+  if ((rc != 0)); then
+    case $rc in
+    28) die "timed out after ${TIMEOUT}s${action:+ fetching $action} — this panel is slow or huge; retry with XTREAM_TIMEOUT=900" ;;
+    6) die "cannot resolve host in $XTREAM_HOST" ;;
+    7) die "cannot connect to $XTREAM_HOST" ;;
+    22) die "server rejected the request (HTTP error) at $XTREAM_HOST" ;;
+    *) die "request failed (curl exit $rc) — $XTREAM_HOST" ;;
+    esac
+  fi
+
+  # A rejected line still answers HTTP 200, with {"user_info":{"auth":0}}.
+  if jq -e 'type == "object" and (.user_info.auth? == 0)' >/dev/null 2>&1 <<<"$resp"; then
+    die "authentication rejected — check the credentials for profile '$PROFILE'"
+  fi
+
+  printf '%s' "$resp"
+}
+
+mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
+
+# Portable content hash for dedup: shasum on macOS, sha1sum on most Linux,
+# cksum as a last resort. Only stability matters, not the algorithm.
+hash_text() {
+  if command -v shasum >/dev/null 2>&1; then shasum
+  elif command -v sha1sum >/dev/null 2>&1; then sha1sum
+  else cksum; fi | cut -d' ' -f1
+}
+
+# Cached GET for the big list endpoints.
+api_cached() {
+  local action="$1"
+  local file="$CACHE_DIR/${PROFILE}.${action}.json"
+
+  if [[ -z $REFRESH && -s $file ]]; then
+    local age=$(($(date +%s) - $(mtime "$file")))
+    if ((age < CACHE_TTL)); then
+      cat "$file"
+      return
+    fi
+  fi
+
+  # These payloads run to tens of megabytes on large panels; say what is
+  # happening so a slow first fetch does not look like a hang.
+  [[ -t 2 ]] && printf '%s' "${D}fetching ${action#get_}…${N}" >&2
+
+  # Fetch into memory first, so a failed request never leaves a stray .tmp
+  # (api() dies on error, which would skip any cleanup after a redirect).
+  local data
+  data="$(api "$action")" || exit 1
+
+  [[ -t 2 ]] && printf '\r\033[2K' >&2
+
+  mkdir -p "$CACHE_DIR"
+  printf '%s' "$data" >"$file.tmp" && mv -f "$file.tmp" "$file"
+  printf '%s' "$data"
+}
+
+streams_action() {
+  case "$KIND" in
+  live) echo get_live_streams ;;
+  vod) echo get_vod_streams ;;
+  series) echo get_series ;;
+  *) die "unknown type '$KIND' (use live, vod or series)" ;;
+  esac
+}
+
+categories_action() {
+  case "$KIND" in
+  live) echo get_live_categories ;;
+  vod) echo get_vod_categories ;;
+  series) echo get_series_categories ;;
+  esac
+}
+
+# id<TAB>name<TAB>category, optionally filtered by a case-insensitive regex.
+list_streams() {
+  local query="${1:-}"
+  local cats streams
+
+  # `|| exit 1` on every capture: die() runs inside these substitutions, and
+  # without it the caller would sail on and fire the next request anyway.
+  cats="$(api_cached "$(categories_action)")" || exit 1
+  streams="$(api_cached "$(streams_action)")" || exit 1
+
+  jq -r --arg q "$query" --argjson cats "$cats" '
+    ($cats | map({key: (.category_id | tostring), value: .category_name}) | from_entries) as $cmap
+    | .[]
+    | select($q == "" or (.name | test($q; "i")))
+    | [ (.stream_id // .series_id // .num | tostring),
+        .name,
+        ($cmap[(.category_id | tostring)] // "-") ]
+    | @tsv
+  ' <<<"$streams"
+}
+
+stream_url() {
+  local id="$1"
+  case "$KIND" in
+  live) printf '%s/live/%s/%s/%s.ts' "$XTREAM_HOST" "$XTREAM_USER" "$XTREAM_PASS" "$id" ;;
+  vod)
+    local vod ext
+    vod="$(api_cached get_vod_streams)" || exit 1
+    ext="$(jq -r --arg id "$id" '
+      [.[] | select((.stream_id|tostring) == $id) | .container_extension // "mp4"][0] // "mp4"' <<<"$vod")"
+    printf '%s/movie/%s/%s/%s.%s' "$XTREAM_HOST" "$XTREAM_USER" "$XTREAM_PASS" "$id" "${ext:-mp4}"
+    ;;
+  series) die "series are containers, not streams — pick an episode in a full client" ;;
+  esac
+}
+
+# Accept a numeric id as-is; otherwise resolve a query to exactly one id.
+resolve_id() {
+  local arg="$1"
+  if [[ $arg =~ ^[0-9]+$ ]]; then
+    printf '%s' "$arg"
+    return
+  fi
+
+  local matches count
+  matches="$(list_streams "$arg")" || exit 1
+  count="$(grep -c . <<<"$matches" || true)"
+
+  case "$count" in
+  0) die "no $KIND channel matches '$arg'" ;;
+  1) cut -f1 <<<"$matches" ;;
+  *)
+    # Only reach for fzf when there is a terminal to drive it — otherwise a
+    # scripted or piped call hangs forever on an invisible picker.
+    if [[ -t 0 && -t 2 ]] && command -v fzf >/dev/null 2>&1; then
+      cut -f1 <<<"$(fzf --with-nth=2.. --delimiter='\t' --prompt="$KIND> " <<<"$matches")"
+    else
+      echo "${Y}$count matches for '$arg'${N} — narrow it down or pass an id:" >&2
+      column -t -s $'\t' <<<"$matches" >&2
+      exit 1
+    fi
+    ;;
+  esac
+}
+
+# ---------------------------------------------------------------- commands ---
+
+cmd_status() {
+  if [[ -n ${STALKER:-} ]]; then
+    local sout server mac st exp days
+    sout="$(stalker_run status)" || exit 1
+    server="$(sed -n 's/^server *//p' <<<"$sout")"
+    mac="$(sed -n 's/^mac *//p' <<<"$sout")"
+    st="$(sed -n 's/^status *//p' <<<"$sout")"
+    exp="$(sed -n 's/^expires *//p' <<<"$sout")"
+    local col="$Y"
+    [[ $st == Active ]] && col="$G"
+    [[ $st == Expired ]] && col="$R"
+    printf '%-13s%s\n' profile "${D}(stalker portal)${N}"
+    printf '%-13s%s\n' server "$server"
+    printf '%-13s%s\n' mac "$mac"
+    printf '%-13s%s\n' status "${col}${st}${N}"
+    [[ -n $exp ]] && printf '%-13s%s\n' expires "$exp"
+    days="$(sed -n 's/.*(\(-*[0-9]*\) days).*/\1/p' <<<"$exp")"
+    if [[ $days =~ ^-?[0-9]+$ ]]; then
+      if ((days < 0)); then echo "${R}✗ line expired${N}"
+      elif ((days <= 7)); then echo "${Y}! expires in $days day(s)${N}"; fi
+    fi
+    return
+  fi
+
+  # One field per line: bash collapses runs of tabs when IFS is whitespace,
+  # so a TSV row with an empty field would silently shift every column.
+  # Built with a read loop rather than mapfile — macOS ships bash 3.2.
+  local -a f=()
+  local line
+  while IFS= read -r line; do f+=("$line"); done < <(
+    api | jq -r '
+      def nz: if . == null or . == "" then "-" else (. | tostring) end;
+      def human(ts):
+        if ts == null or ts == "" then "never"
+        else (ts | tonumber | localtime | strftime("%Y-%m-%d %H:%M")) end;
+
+      .user_info as $u | .server_info as $s |
+      ($u.status | nz),
+      ($u.username | nz),
+      human($u.exp_date),
+      ($u.exp_date | nz),
+      (if ($u.is_trial // "0") == "1" then "yes" else "no" end),
+      ($u.active_cons | nz),
+      ($u.max_connections | nz),
+      ($s.timezone | nz)
+    '
+  )
+
+  local status="${f[0]}" username="${f[1]}" expires="${f[2]}" exp_ts="${f[3]}"
+  local trial="${f[4]}" active="${f[5]}" maxcons="${f[6]}" tz="${f[7]}"
+
+  local status_color="$Y"
+  [[ $status == Active ]] && status_color="$G"
+  [[ $status == Expired || $status == Banned || $status == Disabled ]] && status_color="$R"
+
+  local left="" days=""
+  if [[ $exp_ts =~ ^[0-9]+$ ]]; then
+    left=$((exp_ts - $(date +%s)))
+    # Round up: a line dying in 2h51m still reads as "1 day", not "0".
+    ((left >= 0)) && days=$(((left + 86399) / 86400)) || days=$((left / 86400))
+    expires="$expires  ${D}($days days)${N}"
+  fi
+
+  if [[ -n ${URL_OVERRIDE:-} ]]; then
+    printf '%-13s%s\n' profile "${D}(ad-hoc URL — 'xtream … save NAME' to keep it)${N}"
+  else
+    printf '%-13s%s\n' profile "$PROFILE"
+  fi
+  printf '%-13s%s\n' server "$XTREAM_HOST"
+  printf '%-13s%s\n' username "$username"
+  printf '%-13s%s\n' status "${status_color}${status}${N}"
+  printf '%-13s%s\n' expires "$expires"
+  printf '%-13s%s\n' trial "$trial"
+  printf '%-13s%s\n' connections "$active / $maxcons"
+  printf '%-13s%s\n' timezone "$tz"
+
+  # Loud warning when the line is close to the wire.
+  if [[ -n $left ]]; then
+    if ((left < 0)); then
+      echo "${R}✗ line expired${N}"
+    elif ((days <= 7)); then
+      echo "${Y}! expires in $days day(s)${N}"
+    fi
+  fi
+}
+
+cmd_counts() {
+  if [[ -n ${STALKER:-} ]]; then
+    stalker_run counts
+    return
+  fi
+  local live vod series
+  live="$(api_cached get_live_streams)" || exit 1
+  vod="$(api_cached get_vod_streams)" || exit 1
+  series="$(api_cached get_series)" || exit 1
+
+  printf 'live    %s\n' "$(jq 'length' <<<"$live")"
+  printf 'movies  %s\n' "$(jq 'length' <<<"$vod")"
+  printf 'series  %s\n' "$(jq 'length' <<<"$series")"
+}
+
+cmd_search() {
+  local out
+  if [[ -n ${STALKER:-} ]]; then
+    out="$(stalker_run search "${1:-}")" || exit 1
+  else
+    out="$(list_streams "${1:-}")" || exit 1
+    [[ -n $out ]] || die "no $KIND channel matches '${1:-}'"
+  fi
+  if [[ -t 1 ]]; then
+    column -t -s $'\t' <<<"$out"
+  else
+    printf '%s\n' "$out"
+  fi
+}
+
+cmd_categories() {
+  local out
+  out="$(api_cached "$(categories_action)")" || exit 1
+  out="$(jq -r '.[] | [.category_id, .category_name] | @tsv' <<<"$out")"
+  if [[ -t 1 ]]; then
+    column -t -s $'\t' <<<"$out"
+  else
+    printf '%s\n' "$out"
+  fi
+}
+
+cmd_url() {
+  [[ -n ${1:-} ]] || die "usage: xtream url <ID|QUERY>"
+  if [[ -n ${STALKER:-} ]]; then
+    stalker_run url "$1" || exit 1
+    return
+  fi
+  local id
+  id="$(resolve_id "$1")" || exit 1
+  stream_url "$id"
+  echo
+}
+
+cmd_play() {
+  need mpv
+  need fzf
+  [[ -t 0 ]] || die "play needs a terminal for the picker — use 'xtream url' and pipe that to mpv"
+  local list pick id url
+  if [[ -n ${STALKER:-} ]]; then
+    list="$(stalker_run search "${1:-}")" || exit 1
+  else
+    list="$(list_streams "${1:-}")" || exit 1
+    [[ -n $list ]] || die "no $KIND channel matches '${1:-}'"
+  fi
+
+  pick="$(fzf --with-nth=2.. --delimiter='\t' --prompt="stream> " <<<"$list" || true)"
+  [[ -n $pick ]] || exit 0
+
+  id="$(cut -f1 <<<"$pick")"
+  if [[ -n ${STALKER:-} ]]; then
+    url="$(stalker_run url "$id")" || exit 1
+  else
+    url="$(stream_url "$id")" || exit 1
+  fi
+  echo "${B}▶${N} $(cut -f2 <<<"$pick")"
+  mpv --really-quiet "$url"
+}
+
+cmd_check() {
+  need ffprobe
+  [[ -n ${1:-} ]] || die "usage: xtream check <ID|QUERY>"
+
+  local id url info errlog rc=0 tracks code
+  if [[ -n ${STALKER:-} ]]; then
+    id="$1"
+    url="$(stalker_run url "$1")" || exit 1
+  else
+    id="$(resolve_id "$1")" || exit 1
+    url="$(stream_url "$id")" || exit 1
+  fi
+
+  # Ask the server first: ffprobe reports refusals as "4XX Client Error, but
+  # not one of 40{0,1,3,4}", which tells you nothing. Panels lean on
+  # non-standard codes, so surface the number and what it usually means.
+  local probe redir
+  probe="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' \
+    --connect-timeout "$CONNECT_TIMEOUT" --max-time 10 -r 0-1024 "$url" 2>/dev/null || true)"
+  code="${probe%% *}"
+  redir="${probe#* }"
+
+  # Panels answer dead channels with a placeholder clip instead of an error,
+  # so ffprobe decodes it happily and the channel looks alive. The redirect
+  # target is what gives it away.
+  case "$redir" in
+  *offline* | *no_signal* | *nosignal* | *not_available* | *comingsoon*)
+    echo "${Y}⚠ stream $id is a placeholder, not live${N}"
+    echo "  the panel redirects to ${redir##*/} — the channel is listed but off air"
+    exit 1
+    ;;
+  esac
+
+  case "$code" in
+  2* | 3* | "") ;; # let ffprobe have the final say
+  000) die "no response from $XTREAM_HOST for stream $id" ;;
+  *)
+    echo "${R}✗ stream $id refused by the server (HTTP $code)${N}"
+    # Panels front themselves with proxies that invent status codes. These are
+    # the ones seen in the wild; 456 in particular is decided per-account,
+    # before the channel is even looked up.
+    case "$code" in
+    456) echo "  456 — the panel refuses this account for playback (blocked line, or a geo/IP restriction). Same code for every channel, including ids that don't exist" >&2 ;;
+    403) echo "  403 — credentials rejected for playback, though the API accepted them" >&2 ;;
+    404) echo "  404 — no such stream id" >&2 ;;
+    509 | 512) echo "  connection limit reached — check 'connections' in xtream status" >&2 ;;
+    513) echo "  513 — the panel does not recognise these credentials" >&2 ;;
+    884) echo "  884 — playlist/stream download blocked by the panel's CDN proxy" >&2 ;;
+    esac
+    exit 1
+    ;;
+  esac
+
+  # Keep stderr out of the JSON: decoders happily log warnings at error level
+  # ("non-existing SPS 0 referenced...") on perfectly playable streams.
+  errlog="$(mktemp "${TMPDIR:-/tmp}/xtream.XXXXXX")"
+
+  # -show_streams, not -show_entries stream=...: the latter also walks the
+  # programs section of a .ts and reports every stream twice.
+  info="$(ffprobe -v error -print_format json -show_streams \
+    -timeout "$((PROBE_TIMEOUT * 1000000))" "$url" 2>"$errlog")" || rc=$?
+
+  tracks="$(jq -r '.streams | length' <<<"${info:-}" 2>/dev/null || echo 0)"
+
+  if ((rc != 0)) || [[ ${tracks:-0} -eq 0 ]]; then
+    echo "${R}✗ stream $id is not playing${N}"
+    sed 's/^/  /' "$errlog" >&2
+    [[ ${tracks:-0} -eq 0 && $rc -eq 0 ]] && echo "  ffprobe found no audio/video tracks" >&2
+    rm -f "$errlog"
+    exit 1
+  fi
+
+  echo "${G}✓ stream $id is live${N}"
+  jq -r '
+    def fps: (.r_frame_rate // "0/1" | split("/")
+              | if (.[1] | tonumber) == 0 then 0
+                else ((.[0] | tonumber) / (.[1] | tonumber)) end
+              | . * 100 | round / 100);
+    .streams[]
+    # Multi-program transport streams list phantom 0x0 / 0-channel tracks
+    # alongside the real one; drop them so the summary shows what plays.
+    | select(
+        (.codec_type == "video" and (.width // 0) > 0) or
+        (.codec_type == "audio" and (.channels // 0) > 0) or
+        (.codec_type != "video" and .codec_type != "audio")
+      )
+    | if .codec_type == "video" then
+        "  video  \(.codec_name)  \(.width)x\(.height)  \(fps)fps"
+      elif .codec_type == "audio" then
+        "  audio  \(.codec_name)  \(.channels // "?")ch  \(.sample_rate // "?")Hz"
+      else
+        "  \(.codec_type)  \(.codec_name)"
+      end
+  ' <<<"$info" | awk '!seen[$0]++'
+
+  # Surface decoder complaints without calling the stream dead.
+  if [[ -s $errlog ]]; then
+    echo "  ${D}$(wc -l <"$errlog" | tr -d ' ') decoder warning(s) — stream still decodes${N}"
+  fi
+  rm -f "$errlog"
+}
+
+cmd_raw() {
+  [[ -n ${1:-} ]] || die "usage: xtream raw <ACTION>"
+  api "$1"
+}
+
+# The verdict on an unfamiliar playlist, cheapest data first.
+#
+# Deliberately does NOT call cmd_counts: movie and series catalogues run to
+# 60MB+ each on a large panel, which is minutes of waiting for two numbers.
+# Status and categories are small, and the live list is the one people
+# actually want to search.
+cmd_quick() {
+  cmd_status
+  echo
+
+  local cats total
+  cats="$(api_cached get_live_categories)" || exit 1
+  total="$(jq 'length' <<<"$cats")"
+
+  echo "${D}categories ($total)${N}"
+  # Slice inside jq: piping into `head` kills jq with SIGPIPE once the output
+  # outgrows the pipe buffer, and pipefail turns that into a fatal error.
+  jq -r '.[0:12][] | "  \(.category_name)"' <<<"$cats"
+  ((total > 12)) && echo "  ${D}… and $((total - 12)) more${N}"
+  echo
+
+  local live
+  live="$(api_cached get_live_streams)" || exit 1
+  printf 'live channels  %s\n' "$(jq 'length' <<<"$live")"
+  echo "${D}movies/series: xtream counts (downloads the full catalogue)${N}"
+  echo
+  echo "${D}next:${N} xtream search <name>   xtream check <id>   xtream save <profile>"
+}
+
+cmd_save() {
+  local name="${1:-default}"
+  local conf="$CONFIG_DIR/$name.conf"
+
+  if [[ -e $conf && -z ${FORCE:-} ]]; then
+    die "$conf already exists — pass -f to overwrite"
+  fi
+
+  mkdir -p "$CONFIG_DIR"
+  umask 077
+  cat >"$conf" <<EOF
+XTREAM_HOST=$XTREAM_HOST
+XTREAM_USER=$XTREAM_USER
+XTREAM_PASS=$XTREAM_PASS
+EOF
+  chmod 600 "$conf"
+  echo "${G}✓ saved profile '$name'${N} → $conf"
+  [[ $name == default ]] || echo "  use it with: xtream -p $name status"
+}
+
+# -------------------------------------------------------------------- main ---
+
+main() {
+  while [[ ${1:-} == -* ]]; do
+    case "$1" in
+    -p | --profile)
+      PROFILE="${2:?--profile needs a name}"
+      shift 2
+      ;;
+    -t | --type)
+      KIND="${2:?--type needs live|vod|series}"
+      shift 2
+      ;;
+    -u | --url)
+      URL_OVERRIDE="${2:?--url needs a playlist URL}"
+      shift 2
+      ;;
+    -c | --connect-timeout)
+      CONNECT_TIMEOUT="${2:?--connect-timeout needs seconds}"
+      shift 2
+      ;;
+    -r | --refresh)
+      REFRESH=1
+      shift
+      ;;
+    -v | --stats)
+      STATS=1
+      shift
+      ;;
+    -f | --force)
+      FORCE=1
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *) die "unknown option '$1' (try --help)" ;;
+    esac
+  done
+
+  case "$KIND" in
+  live | vod | series) ;;
+  *) die "unknown type '$KIND' (use live, vod or series)" ;;
+  esac
+
+  need curl
+  need jq
+
+  # A shared dump — base64 paste code or a paste.sh URL — expands to many
+  # lines, so it routes to batch mode instead of loading a single line.
+  if [[ ${1:-} == batch ]]; then
+    shift
+    cmd_batch "$@"
+    return
+  fi
+  if [[ -n ${1:-} ]] && { [[ ${1} == *paste.sh/* ]] || maybe_base64_url "$1" >/dev/null; }; then
+    cmd_batch "$@"
+    return
+  fi
+
+  # A bare URL as the first argument is the fast path: paste what the provider
+  # sent you and get a verdict, no profile setup.
+  local default_cmd="status"
+  if [[ ${1:-} == http://* || ${1:-} == https://* ]]; then
+    URL_OVERRIDE="$1"
+    default_cmd="quick"
+    shift
+  elif [[ ${1:-} == stalker:* ]]; then
+    URL_OVERRIDE="$1"
+    shift
+  fi
+
+  local cmd="${1:-$default_cmd}"
+  [[ $# -gt 0 ]] && shift
+
+  load_config
+
+  case "$cmd" in
+  status) cmd_status ;;
+  quick) cmd_quick ;;
+  batch) cmd_batch "$@" ;;
+  save) cmd_save "${1:-default}" ;;
+  search) cmd_search "${1:-}" ;;
+  categories | cats) cmd_categories ;;
+  url) cmd_url "${1:-}" ;;
+  play) cmd_play "${1:-}" ;;
+  check) cmd_check "${1:-}" ;;
+  counts) cmd_counts ;;
+  raw) cmd_raw "${1:-}" ;;
+  help) usage ;;
+  *) die "unknown command '$cmd' (try --help)" ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,5 @@
+# Local credentials & caches must never be committed
+.config/
+*.conf
+xtream-batch.*
+.DS_Store
