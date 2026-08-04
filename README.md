@@ -18,7 +18,13 @@ It speaks two protocols:
 
 ## Platform
 
-Works on **macOS and Linux**. It's a single Bash script (Bash 3.2+, so stock macOS is fine) using standard Unix tools.
+It's a single Bash script (Bash 3.2+, so stock macOS is fine) using standard Unix tools.
+
+- **macOS** — works out of the box.
+- **Linux** — works out of the box.
+- **Windows** — not native (it's a Bash script), but two supported paths:
+  - **WSL** (recommended) — [Windows Subsystem for Linux](https://learn.microsoft.com/windows/wsl/install) *is* Linux, so it runs exactly as above. `wsl --install`, then treat it like any Linux box.
+  - **Git Bash / MSYS2** — the script itself is portable, but the extra tools (`jq`, `python3`, `ffmpeg`, `mpv`, `fzf`) aren't bundled; install them via [MSYS2](https://www.msys2.org/)'s `pacman`. Minimal Git Bash may also lack `column`, in which case tables print unaligned but still work.
 
 ## Requirements
 

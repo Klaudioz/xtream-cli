@@ -799,6 +799,13 @@ hash_text() {
   else cksum; fi | cut -d' ' -f1
 }
 
+# Align a TSV on stdin into columns, falling back to raw output where
+# `column` is missing (e.g. a minimal Git Bash on Windows).
+tabulate() {
+  if command -v column >/dev/null 2>&1; then column -t -s "$(printf '\t')"
+  else cat; fi
+}
+
 # Cached GET for the big list endpoints.
 api_cached() {
   local action="$1"
@@ -903,7 +910,7 @@ resolve_id() {
       cut -f1 <<<"$(fzf --with-nth=2.. --delimiter='\t' --prompt="$KIND> " <<<"$matches")"
     else
       echo "${Y}$count matches for '$arg'${N} — narrow it down or pass an id:" >&2
-      column -t -s $'\t' <<<"$matches" >&2
+      tabulate <<<"$matches" >&2
       exit 1
     fi
     ;;
@@ -1022,7 +1029,7 @@ cmd_search() {
     [[ -n $out ]] || die "no $KIND channel matches '${1:-}'"
   fi
   if [[ -t 1 ]]; then
-    column -t -s $'\t' <<<"$out"
+    tabulate <<<"$out"
   else
     printf '%s\n' "$out"
   fi
@@ -1033,7 +1040,7 @@ cmd_categories() {
   out="$(api_cached "$(categories_action)")" || exit 1
   out="$(jq -r '.[] | [.category_id, .category_name] | @tsv' <<<"$out")"
   if [[ -t 1 ]]; then
-    column -t -s $'\t' <<<"$out"
+    tabulate <<<"$out"
   else
     printf '%s\n' "$out"
   fi
