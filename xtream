@@ -221,14 +221,21 @@ fetch_pastesh() {
   local id="${base##*/}"
   [[ -n $id && $hash != "$url" ]] || die "not a decryptable paste.sh URL (need the #key part)"
 
-  local ct
-  ct="$(curl -fsS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$TIMEOUT" "$base.txt")" \
-    || die "could not fetch paste $id"
+  # Fetch the ciphertext to a file, not a shell variable: big pastes run to
+  # megabytes, and passing that to python via an env var blows past ARG_MAX
+  # ("Argument list too long"). Python reads the file; only its short path
+  # goes through the environment.
+  local ctfile ok=1
+  ctfile="$(mktemp "${TMPDIR:-/tmp}/xtream.XXXXXX")"
+  curl -fsS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$TIMEOUT" "$base.txt" -o "$ctfile" \
+    || { rm -f "$ctfile"; die "could not fetch paste $id"; }
 
-  XT_CT="$ct" XT_ID="$id" XT_HASH="$hash" python3 - <<'PY' || die "paste decryption failed — wrong key, or not a v3 paste"
+  XT_CTFILE="$ctfile" XT_ID="$id" XT_HASH="$hash" python3 - <<'PY' || ok=0
 import base64, hashlib, os, subprocess, sys
 
-blob = base64.b64decode("".join(os.environ["XT_CT"].split()))
+with open(os.environ["XT_CTFILE"], "rb") as fh:
+    raw = fh.read()
+blob = base64.b64decode(b"".join(raw.split()))
 if blob[:8] != b"Salted__":
     sys.exit("no OpenSSL salt header")
 salt, data = blob[8:16], blob[16:]
@@ -244,6 +251,8 @@ if p.returncode:
     sys.exit(p.stderr.decode()[:200] or "openssl failed")
 sys.stdout.buffer.write(p.stdout)
 PY
+  rm -f "$ctfile"
+  ((ok)) || die "paste decryption failed — wrong key, or not a v3 paste"
 }
 
 # --- Stalker / Ministra portal client ---------------------------------------
@@ -403,11 +412,12 @@ else:
 PY
 }
 
-# Emit every distinct Xtream line URL found in text on stdin. Handles two
+# Emit every distinct Xtream line URL found in text on stdin. Handles the
 # shapes these dumps come in:
-#   1. full get.php / player_api.php URLs, one per line
-#   2. a bare host line ("http://host:80") followed by a "user  pass  Expires"
-#      table — reconstruct a get.php URL from each row
+#   1. full get.php / player_api.php URLs, one per line (or in "M3U:" lines)
+#   2. a bare host line ("http://host:80") + a "user  pass  Expires" table
+#   3. a host URL + "Username:/Password:" (or "User:/Pass:") pairs
+#   4. Stalker portals: "Panel ➤ <portal>" + "Mac ➤ <mac>"
 extract_xtream_urls() {
   awk '
     function emit(u) { if (!seen[u]++) print u }
@@ -422,8 +432,7 @@ extract_xtream_urls() {
       }
     }
 
-    # (3) Stalker portals: "Panel ➤ http://host/c/" then "Mac ➤ 00:1A:..."
-    #     emitted as a stalker:<portal>#<mac> token the loader recognises.
+    # (4) Stalker portals: "Panel ➤ http://host/c/" then "Mac ➤ 00:1A:..."
     line ~ /Panel/ && match(line, /https?:\/\/[^[:space:]]+/) {
       sp = substr(line, RSTART, RLENGTH); sub(/\/+$/, "", sp); stalker_portal = sp; next
     }
@@ -432,9 +441,23 @@ extract_xtream_urls() {
       next
     }
 
-    # a bare host URL sets the context for the table rows beneath it
-    line ~ /^https?:\/\/[^[:space:]]+$/ && line !~ /(get\.php|player_api\.php)/ {
-      host = line; sub(/\/+$/, "", host); next
+    # Any scheme-qualified host URL sets the context for the rows/pairs beneath
+    # it. Handles a bare line, a markdown-wrapped [http://h](http://h), or a
+    # "Host: http://h" prefix. get.php URLs are excluded, so an "M3U:" line
+    # never sets host — that keeps format (1) from being reconstructed twice.
+    line !~ /(get\.php|player_api\.php)/ && match(line, /https?:\/\/[^][()[:space:]]+/) {
+      host = substr(line, RSTART, RLENGTH); sub(/\/+$/, "", host)
+    }
+
+    # (3) "Username:/User:" then "Password:/Pass:" pairs under a host URL
+    line ~ /^[Uu]ser(name)?:[ \t]*/ {
+      pending_user = line; sub(/^[Uu]ser(name)?:[ \t]*/, "", pending_user); next
+    }
+    line ~ /^[Pp]ass(word)?:[ \t]*/ {
+      pp = line; sub(/^[Pp]ass(word)?:[ \t]*/, "", pp)
+      if (host != "" && pending_user != "" && pp != "")
+        emit(host "/get.php?username=" pending_user "&password=" pp "&type=m3u_plus")
+      pending_user = ""; next
     }
 
     # (2) "user  pass  [Expires…]" rows under a host — fields split on 2+ spaces
@@ -442,7 +465,6 @@ extract_xtream_urls() {
       n = split(line, f, /[ \t][ \t]+/)
       if (n < 2) next
       u = f[1]; p = f[2]
-      # skip the header row and anything that is not a plain credential token
       lu = tolower(u); lp = tolower(p)
       if (lu ~ /^(usr|user|username|login|line)$/ || lp ~ /^(pw|pass|password)$/) next
       if (u !~ /^[A-Za-z0-9._@+-]{2,}$/ || p !~ /^[A-Za-z0-9._@+-]{2,}$/) next
@@ -632,7 +654,7 @@ cmd_batch() {
     out="$(cat "$tmp/$i.out" 2>/dev/null)"
     sig="$(printf '%s' "$out" | hash_text)"
 
-    if grep -qE 'curl: \(|request failed|server rejected|timed out|authentication rejected' <<<"$out"; then
+    if grep -qE 'curl: \(|request failed|server rejected|timed out|authentication rejected|no channel list' <<<"$out"; then
       cat=ERR; n_err=$((n_err + 1)); err_labels+=("$user")
     elif [[ -z ${out//[[:space:]]/} ]] || grep -q 'no live channel matches' <<<"$out"; then
       cat=EMPTY; n_empty=$((n_empty + 1))
@@ -668,7 +690,9 @@ cmd_batch() {
       echo "${B}${g_host[$k]} · ${g_label[$k]}${N} ${D}— no match${N}"
       ;;
     ERR)
-      code="$(grep -oE '(error: |HTTP )[0-9]{3}' <<<"${g_out[$k]}" | grep -oE '[0-9]{3}' | head -1)"
+      # `|| true`: a connection-refused error carries no numeric code, so the
+      # grep pipeline exits non-zero, which under set -e would kill the render.
+      code="$(grep -oE '(error: |HTTP )[0-9]{3}' <<<"${g_out[$k]}" | grep -oE '[0-9]{3}' | head -1 || true)"
       echo "${B}${g_host[$k]} · ${g_label[$k]}${N} ${R}⚠ $([[ -n $code ]] && echo "HTTP $code" || echo error)${N}"
       ;;
     esac
@@ -861,6 +885,12 @@ list_streams() {
   # without it the caller would sail on and fire the next request anyway.
   cats="$(api_cached "$(categories_action)")" || exit 1
   streams="$(api_cached "$(streams_action)")" || exit 1
+
+  # A dead/misbehaving line can answer HTTP 200 with a non-JSON error page.
+  # Validate before jq, so the user sees a clean message instead of jq's
+  # "invalid JSON text passed to --argjson".
+  jq -e . >/dev/null 2>&1 <<<"$streams" || die "line returned no channel list (rejected or offline)"
+  jq -e . >/dev/null 2>&1 <<<"$cats" || cats="[]"
 
   jq -r --arg q "$query" --argjson cats "$cats" '
     ($cats | map({key: (.category_id | tostring), value: .category_name}) | from_entries) as $cmap

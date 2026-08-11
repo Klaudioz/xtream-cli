@@ -93,6 +93,15 @@ xtream '<base64-code>' --stats         # status + live/movie counts
 
 Lines on a shared server hand out the same channel list, so identical results are folded to `(same as <first line>)` — which conveniently also flags any line whose package differs.
 
+### Paste formats it understands
+
+The decoded paste can be any of these — the tool auto-detects the shape:
+
+- a list of `get.php` / `player_api.php` URLs (or `M3U:` lines containing them)
+- a host line + a `user  pass` table
+- a host URL + `Username:` / `Password:` (or `User:` / `Pass:`) pairs
+- Stalker `Panel ➤ … / Mac ➤ …` blocks (below)
+
 ### Stalker / Ministra portals
 
 Pastes with `Panel ➤ … / Mac ➤ …` blocks are auto-detected — the **MAC is the credential**. Everything works the same:
