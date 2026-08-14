@@ -9,22 +9,22 @@ worth typing into a TV, and typing anything into a TV with a remote is slow
 enough that you only want to do it once.
 
 ```bash
-xtream lines.txt -z santiago -m tnt playable chile -o good.txt
+xtream lines.txt -z london -m 'sky sports' playable uk -o good.txt
 ```
 
-Read as: of every line in the file, keep the ones on a Chilean server, carrying
-channels matching "chile", with TNT among them, that will actually stream one.
-What comes back is ranked, best first:
+Read as: of every line in the file, keep the ones on a British server, carrying
+channels matching "uk", with Sky Sports among them, that will actually stream
+one. What comes back is ranked, best first:
 
 ```
-  1. line 53 · someuser  1270 ch  must 1/1  exp 2026-10-11  conn 1/3  America/Santiago
-     GEO CHILE (REGIONAL) 1062 · ZAPPING CHILE 98 · FUTBÓL CHILE 34
+  1. line 53 · someuser  1270 ch  must 1/1  exp 2026-10-11  conn 1/3  Europe/London
+     UK ENTERTAINMENT 620 · UK SPORTS 210 · UK NEWS 44
      http://panel.example.com:8080/get.php?username=someuser&password=…
      tv: panel.example.com:8080  ·  someuser  ·  somepassword
 ```
 
 The middle line is what it carries, by category and size, because 1270 channels
-are worth nothing if none of them is the football. The last line is the three
+are worth nothing if none of them is the football you want. The last line is the three
 fields a TV asks for, URL-decoded and without the `http://` that every app
 assumes and nobody enjoys typing on a remote.
 
@@ -94,8 +94,8 @@ line gets a number, and that number addresses it for the rest of the session:
 
 ```bash
 xtream lines.txt lines                          # the index: which URL is line 53
-xtream lines.txt -z santiago playable chile     # the sweep
-xtream lines.txt -n 53 search chile             # what line 53 carries
+xtream lines.txt -z london playable uk          # the sweep
+xtream lines.txt -n 53 search uk                # what line 53 carries
 xtream lines.txt -n 53 check 98                 # does that channel really play
 xtream lines.txt -n 53 play 98                  # watch it before committing
 ```
@@ -104,9 +104,9 @@ The sweep has three filters, cheapest first:
 
 | Flag | What it does |
 |------|--------------|
-| `-z RX` | keep lines whose server reports a matching timezone (`santiago`). It comes from a tiny request, so lines that fail it never download a catalogue — this is what makes thousands of lines quick. Expired lines drop out here too. |
-| `QUERY` | matches a channel's name **or** its category, because panels split evenly between "TNT CHILE PREMIUM HD" filed under DEPORTES and "TNT SPORTS 1" filed under FUTBÓL CHILE. `-C RX` restricts to the category alone. |
-| `-m LIST` | channels the line has to carry, comma-separated regexes, matched inside what QUERY already selected. That scoping is what disambiguates the half-dozen `TNT SPORTS <country>` feeds. |
+| `-z RX` | keep lines whose server reports a matching timezone (`london`). It comes from a tiny request, so lines that fail it never download a catalogue — this is what makes thousands of lines quick. Expired lines drop out here too. |
+| `QUERY` | matches a channel's name **or** its category, because panels split evenly between "SKY SPORTS UK MAIN EVENT" filed under SPORTS and "SKY SPORTS MAIN EVENT" filed under UK SPORTS. `-C RX` restricts to the category alone. |
+| `-m LIST` | channels the line has to carry, comma-separated regexes, matched inside what QUERY already selected. That scoping is what tells the British Sky Sports apart from the Italian and German ones. |
 
 Everything else is counted and left out: wrong timezone, expired, no matching
 channels, missing a must-have, lists them but refuses to stream, host long dead.

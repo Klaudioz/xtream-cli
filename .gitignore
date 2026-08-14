@@ -3,3 +3,9 @@
 *.conf
 xtream-batch.*
 .DS_Store
+
+# Sweep output (-o): line credentials, not source
+good.txt
+xtream-2*.txt
+*-playable.txt
+*-channels.txt
