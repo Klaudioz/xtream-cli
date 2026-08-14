@@ -10,6 +10,9 @@ SELF="${BASH_SOURCE[0]}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/xtream"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/xtream"
 CACHE_TTL="${XTREAM_CACHE_TTL:-21600}" # 6h
+# What the last run made of each line, one tiny file per line, so a second
+# sweep over the same dump can leave the known-dead alone. See history_note.
+HIST_DIR="$CACHE_DIR/history"
 
 # Big panels answer get_vod_streams with tens of megabytes, so the overall
 # transfer budget has to be generous. Stalls are caught by the speed floor
@@ -43,6 +46,8 @@ CATQ=""           # --category: restrict search/url to matching categories
 MUST=""           # --must: channels a line has to carry to be of any use
 TZQ=""            # --timezone: skip lines whose server sits somewhere else
 SHOW_ALL=""       # --all: keep the dead/refused rows in a batch listing
+SKIP_SEEN=""      # --skip: seconds within which a known-dead line is left alone
+SKIP_SPEC=""      # … as it was typed ("7d"), which is what to say back
 STALKER=""        # set when the active line is a Stalker/Ministra portal
 STALKER_PORTAL=""
 STALKER_MAC=""
@@ -85,7 +90,7 @@ fmt_duration() {
 out_takes_value() {
   case "${1:-}" in
   "" | -*) return 1 ;;
-  status | quick | batch | lines | search | categories | cats | url | play | check | counts | save | raw | help)
+  status | quick | batch | lines | history | search | categories | cats | url | play | check | counts | playable | save | raw | help)
     return 1 ;;
   esac
   return 0
@@ -270,11 +275,30 @@ WORKING THROUGH A BIG DUMP
     -j N       how many lines to work on at the same time. Scales with the
                dump on its own (16 → 48); pass it only to override
     -T N       give up on a line after N seconds (default 90)
+    -s DUR     skip lines a run in the last DUR found dead or expired
     -o FILE    mirror the whole run into FILE as well as the terminal
     --stats    slower: every line also downloads its full movie catalogue
 
   Channel lists are cached for 6h per line, so a second pass over the same
   dump is far cheaper than the first. Every run prints its wall-clock time.
+
+COMING BACK TO A DUMP YOU ALREADY SWEPT
+  Every sweep writes down what became of each line — server and username, never
+  the password — under ~/.cache/xtream/history/. Two things come of that.
+
+    xtream lines.txt history            # what the last runs made of each line
+
+  …reads back per line: good (it worked), expired (the panel says so), dead
+  (nothing answered), alive (it answered but didn't match the query), with how
+  long ago that was and when it last worked. No network, so it is instant.
+
+    xtream lines.txt -s 7d -z london playable uk
+
+  …leaves out the lines a run in the last week found dead or expired, which on
+  a dump that has been round the block once is most of them. Only those two
+  verdicts are skipped: "didn't match" is an answer about a query, not about
+  the line, so a different query still asks. -r rechecks everything, and -a
+  lists what was skipped.
 
   Stalker/Ministra portals (MAC-based, no username/password) are handled
   too — a paste with "Panel ➤ … / Mac ➤ …" blocks expands like any other,
@@ -285,6 +309,7 @@ COMMANDS
   batch <src> [cmd]   Expand a base64/paste.sh dump or a local file and run
                       cmd on each line
   lines               (batch) Numbered index of the dump: number, user, URL
+  history             (batch) What earlier runs made of each line, and when
   status              Account status: active/expired, expiry date, connections
   search [QUERY]      List channels whose name or category matches QUERY
                       (case-insensitive regex). No QUERY lists everything.
@@ -324,6 +349,9 @@ OPTIONS
                       or @FILE to take them from a run you already have
   -a, --all           Batch: list the dead and refused lines too, not just
                       the ones that worked
+  -s, --skip DUR      Batch: don't recheck lines a run in the last DUR found
+                      dead or expired (7d, 12h, 30m; a bare number means
+                      days). See `history`; -r rechecks them anyway
   -j, --jobs N        Batch: how many lines to work on at the same time.
                       Chosen from the size of the dump unless you set it.
   -o, --out [FILE]    Also write everything to FILE (colours stripped).
@@ -352,6 +380,8 @@ EXAMPLES
   xtream lines.txt -n 53 check 98                 # 3. does that channel work
   xtream lines.txt -n 53 play 98                  # 4. watch it
   xtream lines.txt --stats status -o run.txt      # rank the whole dump instead
+  xtream lines.txt history                        # what earlier runs found
+  xtream lines.txt -s 7d playable uk              # …and don't ask them again
 
   xtream 'http://host:8080/get.php?username=U&password=P'   # is this any good?
   xtream status
@@ -846,6 +876,7 @@ render_status_row() {
 
   if ! grep -q '^status ' <<<"$out"; then
     n_dead=$((n_dead + 1))
+    history_note "$u" dead unreachable
     [[ -n $SHOW_ALL ]] || return 0
     batch_progress_clear
     printf '  %4d. %-22s %s\n' "$n" "${user:-?}" "${R}unreachable/rejected${N}"
@@ -859,9 +890,11 @@ render_status_row() {
   colour="$G"
   if [[ $st == Active ]]; then
     n_active=$((n_active + 1))
+    history_note "$u" good "-" "${exp:--}"
   else
     colour="$R"
     n_expired=$((n_expired + 1))
+    history_note "$u" expired "${st:-expired}" "${exp:--}"
     [[ -n $SHOW_ALL ]] || return 0
   fi
   batch_progress_clear
@@ -887,6 +920,7 @@ render_playable_row() {
 
   if ! grep -q '^playable ' <<<"$out"; then
     n_dead=$((n_dead + 1))
+    history_note "$u" dead unreachable
     [[ -n $SHOW_ALL ]] || return 0
     batch_progress_clear
     printf '  %4d. %-22s %s\n' "$n" "${user:-?}" "${R}unreachable/rejected${N}"
@@ -900,6 +934,14 @@ render_playable_row() {
 
   if [[ $verdict != yes ]]; then
     n_expired=$((n_expired + 1))
+    # Only the panel's own verdict is worth remembering. "no matching channel"
+    # or a timezone it doesn't sit in is an answer to this query, not a fact
+    # about the line, and skipping on it next time would hide a line that the
+    # next query wants.
+    case "$reason" in
+    Expired* | Banned* | Disabled*) history_note "$u" expired "${reason%% *}" ;;
+    *) history_note "$u" alive "${reason:-refused}" ;;
+    esac
     [[ -n $SHOW_ALL ]] || return 0
     batch_progress_clear
     printf '  %4d. %-22s %b%s%b\n' "$n" "${user:-?}" "$R" "${reason:-refused}" "$N"
@@ -907,6 +949,7 @@ render_playable_row() {
   fi
 
   n_active=$((n_active + 1))
+  history_note "$u" good "-" "$(sed -n 's/^expires *//p' <<<"$out")"
 
   # Accounts on one server hand out the same catalogue, and any one of them is
   # as good as the others for typing into a TV. Keep the first that works and
@@ -982,12 +1025,14 @@ render_counts_row() {
 
   if ! grep -q '^live ' <<<"$out"; then
     n_dead=$((n_dead + 1))
+    history_note "$u" dead unreachable
     [[ -n $SHOW_ALL ]] || return 0
     batch_progress_clear
     printf '  %4d. %-22s %s\n' "$n" "${user:-?}" "${R}unreachable/rejected${N}"
     return
   fi
   n_active=$((n_active + 1))
+  history_note "$u" alive answered
   batch_progress_clear
   live="$(sed -n 's/^live *//p' <<<"$out")"
   movies="$(sed -n 's/^movies *//p' <<<"$out")"
@@ -1003,6 +1048,93 @@ batch_label() {
   stalker:*) printf '%s' "${1##*#}" ;;
   *) sed -n 's/.*username=\([^&]*\).*/\1/p' <<<"$1" ;;
   esac
+}
+
+# ----------------------------------------------------------------- history ---
+#
+# A sweep is mostly spent on lines that were already dead the last time. One
+# record per line remembers what became of it, so the next sweep can leave
+# those alone — the same thing the cached catalogues do for the lines that
+# work.
+#
+# Everything here is deliberately fork-free: it runs once per line of a dump,
+# in the parent, between rendering results, and a command substitution there
+# would cost thousands of subshells. Helpers set a global instead of printing.
+
+# Seconds from "7d" / "12h" / "30m" / "90s". A bare number means days, which
+# is the unit anyone reaching for --skip is thinking in.
+parse_duration() {
+  local v="$1" n="${1%[smhdwSMHDW]}"
+  [[ $n =~ ^[0-9]+$ ]] || die "bad duration '$1' — use 30m, 12h, 7d"
+  case "$v" in
+  *s | *S) printf '%s' "$n" ;;
+  *m | *M) printf '%s' $((n * 60)) ;;
+  *h | *H) printf '%s' $((n * 3600)) ;;
+  *w | *W) printf '%s' $((n * 604800)) ;;
+  *) printf '%s' $((n * 86400)) ;;
+  esac
+}
+
+# Sets AGE. "3d ago" is all anyone reads off a history listing.
+fmt_age() {
+  local s="$1"
+  if ((s < 90)); then AGE="just now"
+  elif ((s < 5400)); then AGE="$((s / 60))m ago"
+  elif ((s < 172800)); then AGE="$((s / 3600))h ago"
+  else AGE="$((s / 86400))d ago"; fi
+}
+
+# Sets HKEY: the identity of a line, which is its server and username — never
+# the password, which has no business on disk. Line numbers can't be the key:
+# the same line sits at a different number in the next dump.
+history_key() {
+  local u="$1" id user
+  case "$u" in
+  stalker:*) id="$u" ;;
+  *)
+    id="${u#*://}"
+    id="${id%%/*}"
+    user="${u#*username=}"
+    [[ $user == "$u" ]] && user="" || user="${user%%&*}"
+    id="${id}_${user}"
+    ;;
+  esac
+  id="${id//[!A-Za-z0-9._-]/_}"
+  HKEY="${id:0:150}"
+}
+
+# Sets HIST_TS / HIST_VERDICT / HIST_GOOD / HIST_EXP / HIST_NOTE from a record,
+# non-zero if there isn't one. Fields are never empty on disk — with IFS set to
+# a tab, bash collapses a run of them and every column after a blank would
+# shift by one.
+history_read() {
+  local f="$HIST_DIR/$1"
+  HIST_TS=0 HIST_VERDICT="" HIST_GOOD=0 HIST_EXP="-" HIST_NOTE="-"
+  [[ -s $f ]] || return 1
+  IFS=$'\t' read -r HIST_TS HIST_VERDICT HIST_GOOD HIST_EXP HIST_NOTE <"$f" || true
+  [[ $HIST_TS =~ ^[0-9]+$ ]] || { HIST_TS=0; return 1; }
+  [[ $HIST_GOOD =~ ^[0-9]+$ ]] || HIST_GOOD=0
+  return 0
+}
+
+# Record what a line turned out to be. Verdicts are deliberately few:
+#   good     it answered and is usable (a sweep hit, or an active account)
+#   expired  the panel says Expired/Banned/Disabled
+#   dead     nothing answered
+#   alive    it answered but didn't qualify — a wrong timezone, a missing
+#            channel. Never skipped, because that verdict depends on the query
+#            and the next run may ask something else.
+# Only the parent writes these, as each result lands, so two workers never
+# touch one file.
+history_note() {
+  local u="$1" verdict="$2" note="${3:--}" exp="${4:--}" good=0
+  history_key "$u"
+  history_read "$HKEY" && good="$HIST_GOOD"
+  [[ $verdict == good ]] && good="$HIST_NOW"
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$HIST_NOW" "$verdict" "$good" "${exp:--}" "${note:--}" \
+    >"$HIST_DIR/$HKEY" 2>/dev/null || true
+  return 0
 }
 
 cmd_batch() {
@@ -1023,6 +1155,9 @@ cmd_batch() {
     -m | --must) MUST="${2:?--must needs a channel name (or a comma-separated list)}"; shift 2 ;;
     -z | --timezone) TZQ="${2:?--timezone needs a regex, e.g. london}"; shift 2 ;;
     -a | --all) SHOW_ALL=1; shift ;;
+    -s | --skip)
+      SKIP_SEEN="$(parse_duration "${2:?--skip needs a duration, e.g. 7d}")"
+      SKIP_SPEC="$2"; shift 2 ;;
     -o | --out)
       if out_takes_value "${2:-}"; then setup_out "$2"; shift 2; else setup_out ""; shift; fi ;;
     -c | --connect-timeout)
@@ -1067,6 +1202,46 @@ cmd_batch() {
     return
   fi
 
+  local HIST_NOW
+  HIST_NOW="$(date +%s)"
+  mkdir -p "$HIST_DIR" 2>/dev/null || true
+
+  # `history` is what the last runs made of this dump: no network either, so
+  # it answers instantly and says which lines a sweep would now skip.
+  if [[ $sub == history ]]; then
+    local hu hcol hdetail hage hn_known=0
+    for k in $(seq 1 ${#urls[@]}); do
+      hu="${urls[$((k - 1))]}"
+      history_key "$hu"
+      if ! history_read "$HKEY"; then
+        printf '  %4d. %-22s %s\n' \
+          "${idx[$((k - 1))]}" "$(batch_label "$hu")" "${D}never checked${N}"
+        continue
+      fi
+      hn_known=$((hn_known + 1))
+      fmt_age $((HIST_NOW - HIST_TS))
+      hage="$AGE"
+      case "$HIST_VERDICT" in
+      good) hcol="$G"; hdetail="${HIST_EXP:--}"; [[ $hdetail == - ]] && hdetail="" || hdetail="exp $hdetail" ;;
+      dead | expired) hcol="$R"; hdetail="$HIST_NOTE" ;;
+      *) hcol="$Y"; hdetail="$HIST_NOTE" ;;
+      esac
+      [[ $hdetail == - ]] && hdetail=""
+      # A line that has worked before is worth another look even if it is
+      # down now, so say when it last did.
+      if [[ $HIST_VERDICT != good ]] && ((HIST_GOOD > 0)); then
+        fmt_age $((HIST_NOW - HIST_GOOD))
+        hdetail="${hdetail:+$hdetail  }${D}last good $AGE${N}"
+      fi
+      printf '  %4d. %-22s %b%-8s%b %-10s %s\n' \
+        "${idx[$((k - 1))]}" "$(batch_label "$hu")" \
+        "$hcol" "$HIST_VERDICT" "$N" "$hage" "$hdetail"
+    done
+    echo
+    echo "${D}── ${#urls[@]} lines · ${hn_known} on record · kept in $HIST_DIR${N}"
+    return
+  fi
+
   # One line selected — almost always `-n N` — is not a batch at all. Run it
   # here, in this shell, so it behaves exactly like handing xtream that line's
   # URL: full status block, working picker, mpv on the terminal, raw URL on
@@ -1082,6 +1257,45 @@ cmd_batch() {
   fi
 
   [[ $sub != play ]] || die "play needs one line — pick it with -n N (see 'xtream $input lines')"
+
+  # --skip: most of a re-run over a stale dump is spent waiting on hosts that
+  # were already gone last time. Drop those before a single request goes out.
+  # Only dead and expired qualify — see history_note — and -r rechecks the lot.
+  local n_skipped=0
+  if [[ -n $SKIP_SEEN && -z $REFRESH ]]; then
+    local -a sk_urls=() sk_idx=()
+    local su sk_show=""
+    [[ $SKIP_SPEC =~ ^[0-9]+$ ]] && SKIP_SPEC="${SKIP_SPEC}d"
+    for k in $(seq 1 ${#urls[@]}); do
+      su="${urls[$((k - 1))]}"
+      history_key "$su"
+      if history_read "$HKEY" &&
+        [[ $HIST_VERDICT == dead || $HIST_VERDICT == expired ]] &&
+        ((HIST_NOW - HIST_TS < SKIP_SEEN)); then
+        n_skipped=$((n_skipped + 1))
+        # Held back rather than printed here, so the count comes first and a
+        # -a listing reads as an explanation of it.
+        if [[ -n $SHOW_ALL ]]; then
+          fmt_age $((HIST_NOW - HIST_TS))
+          sk_show="$sk_show$(printf '  %4d. %-22s %s' "${idx[$((k - 1))]}" \
+            "$(batch_label "$su")" "${D}skipped — $HIST_VERDICT $AGE${N}")
+"
+        fi
+        continue
+      fi
+      sk_urls+=("$su")
+      sk_idx+=("${idx[$((k - 1))]}")
+    done
+    urls=(${sk_urls[@]+"${sk_urls[@]}"})
+    idx=(${sk_idx[@]+"${sk_idx[@]}"})
+    ((n_skipped == 0)) ||
+      echo "${D}skipping ${n_skipped} line(s) a run in the last ${SKIP_SPEC} found dead or expired${N}"
+    [[ -z $sk_show ]] || printf '%s' "$sk_show"
+    ((${#urls[@]})) || {
+      echo "${D}── nothing left to check (-r rechecks them all)${N}"
+      return
+    }
+  fi
 
   # Pass our own -t/-r flags through to each sub-invocation. Batch lines fail
   # fast on a dead host — no point waiting the full single-line connect budget.
@@ -1194,6 +1408,8 @@ cmd_batch() {
     fi
     [[ -n $SHOW_ALL ]] || ((n_expired + n_dead == 0)) ||
       echo "${D}   $((n_expired + n_dead)) line(s) not shown — -a lists them too${N}"
+    ((n_skipped == 0)) ||
+      echo "${D}   ${n_skipped} more skipped as known dead/expired — -r rechecks them${N}"
     ((retried)) && echo "${D}   retried $retried rate-limited line(s)${N}"
     rm -rf "$tmp"
     return
@@ -1217,10 +1433,13 @@ cmd_batch() {
 
     if grep -qE 'curl: \(|request failed|server rejected|timed out|authentication rejected|no channel list' <<<"$out"; then
       cat=ERR; n_err=$((n_err + 1)); err_labels+=("$user")
+      history_note "$u" dead unreachable
     elif [[ -z ${out//[[:space:]]/} ]] || grep -q 'no live channel matches' <<<"$out"; then
       cat=EMPTY; n_empty=$((n_empty + 1))
+      history_note "$u" alive "no match"
     else
       cat=OK; n_ok=$((n_ok + 1))
+      history_note "$u" alive answered
     fi
 
     gi=-1
@@ -1263,6 +1482,8 @@ cmd_batch() {
 
   echo
   echo "${D}── $total lines · ${n_ok} matched · ${n_empty} no match · ${n_err} dead${N}"
+  ((n_skipped == 0)) ||
+    echo "${D}   ${n_skipped} more skipped as known dead/expired — -r rechecks them${N}"
   if ((n_err)); then
     # Naming every dead line is unreadable once a dump runs to thousands.
     local joined="" shown=0
@@ -2131,6 +2352,11 @@ main() {
     -a | --all)
       SHOW_ALL=1
       shift
+      ;;
+    -s | --skip)
+      SKIP_SEEN="$(parse_duration "${2:?--skip needs a duration, e.g. 7d}")"
+      SKIP_SPEC="$2"
+      shift 2
       ;;
     -o | --out)
       if out_takes_value "${2:-}"; then

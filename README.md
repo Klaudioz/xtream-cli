@@ -115,6 +115,31 @@ and again ranked at the end, so a long run can be interrupted without losing
 what it found. `-o FILE` mirrors the run into a file, and `-n @FILE` reads the
 line numbers back out of one.
 
+### Coming back to a dump you already swept
+
+Every sweep writes down what became of each line — its server and username,
+never the password — under `~/.cache/xtream/history/`. Two things come of that:
+
+```bash
+xtream lines.txt history                        # what earlier runs found
+xtream lines.txt -s 7d -z london playable uk    # …and don't ask them again
+```
+
+`history` reads back, per line, one of **good** (it worked), **expired** (the
+panel says so), **dead** (nothing answered) or **alive** (it answered but
+didn't match what was asked), with how long ago that was and when the line last
+worked. It touches the network not at all, so it is instant.
+
+`-s DUR` then leaves out the lines a run in the last `DUR` found dead or
+expired, which on a dump that has been round the block once is most of them —
+a second pass over 120 dead lines goes from a minute of connect timeouts to
+nothing at all. Only those two verdicts are skipped: "didn't match" is an
+answer about a query, not about the line, so a different query still asks. `-r`
+rechecks everything and `-a` lists what was left out.
+
+Lines are remembered by server and username, not by their position in the file,
+so the record survives a dump being reposted in a different order.
+
 ### Test a single line someone sent you
 
 Paste a provider's URL directly — no setup. With no command it prints a quick
@@ -165,6 +190,7 @@ xtream 'stalker:http://portal.example:80/c/#00:1A:79:XX:XX:XX' check 'bein sport
 |---------|--------------|
 | `playable [QUERY]` | does this line carry these channels **and** stream them? filters on `-z` / QUERY / `-m`, ranks what survives, prints the URL and the TV login fields |
 | `lines` | the numbered index of a dump: number, user, URL |
+| `history` | what earlier runs made of each line, and when — no network |
 | `status` | active/expired, expiry date, connections in use |
 | `search [QUERY]` | channels whose name or category matches a case-insensitive regex |
 | `check <ID\|QUERY>` | probe the stream with ffprobe — does it really play? |
@@ -180,8 +206,9 @@ had handed xtream that line's URL — picker, player and all.
 
 Useful options: `-n` line numbers (`53`, `10-20`, `1,5,900`, `@file`), `-C`
 category, `-m` must-have channels, `-z` timezone, `-a` show the failures too,
-`-o` mirror the run to a file, `-j` how many lines at once (chosen from the size
-of the dump unless you set it), `-T` per-line timeout, `-r` bypass the cache.
+`-s` skip what a recent run found dead, `-o` mirror the run to a file, `-j` how
+many lines at once (chosen from the size of the dump unless you set it), `-T`
+per-line timeout, `-r` bypass the cache.
 
 Every run prints how long it took.
 
@@ -207,6 +234,7 @@ Channel lists are cached under `~/.cache/xtream/` for 6 hours (`-r` bypasses the
 
 - **No credentials live in this repository.** The script reads them at runtime from the URL you pass or from your local `~/.config/xtream/` files, which are never committed.
 - Profile files are written with `600` permissions, and secrets can be kept in 1Password instead of on disk.
+- The per-line records behind `history` / `-s` hold a server, a username, a verdict and a date. **No password is ever written to them** — a line is identified by where it lives and who it logs in as. Delete `~/.cache/xtream/history/` to forget the lot.
 - The base64 codes shared on [r/IPTV_ZONENEW](https://www.reddit.com/r/IPTV_ZONENEW/) contain **other people's line credentials**, posted publicly by third parties. This tool only reads them; what you do with them is your responsibility. Use it to check lines you're authorized to use.
 
 ## License

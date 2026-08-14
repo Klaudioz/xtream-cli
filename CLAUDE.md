@@ -40,6 +40,12 @@ fields a TV asks for.
   `kill -0` catches one that died. Both are builtins, so polling costs nothing.
   This bug once launched every line of a dump at once — 3238 processes against
   a 4000 limit.
+- **The per-line history helpers must stay fork-free.** `history_key`,
+  `history_read`, `history_note` and `fmt_age` run once per line of a dump, in
+  the parent, between rendering results. They set a global instead of printing
+  precisely so no caller needs `$(...)`, and reaching for `tr`, `sed` or `date`
+  inside them puts thousands of subshells back into the hot loop. `HIST_NOW` is
+  read once per batch for the same reason.
 - **Portability of the small tools.** BSD and GNU differ, so `sed -i`,
   `date +%N` and `grep -P` are out. `column` may be missing entirely, which is
   why `tabulate` has a fallback.
