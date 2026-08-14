@@ -16,8 +16,18 @@ CACHE_TTL="${XTREAM_CACHE_TTL:-21600}" # 6h
 # below, not by a short wall-clock cap.
 CONNECT_TIMEOUT="${XTREAM_CONNECT_TIMEOUT:-15}"
 TIMEOUT="${XTREAM_TIMEOUT:-300}"
-BATCH_CONCURRENCY="${XTREAM_BATCH_CONCURRENCY:-5}"
+# How many lines to work on at the same time. Left alone, it scales with the
+# size of the dump (see batch_autoscale) — the work is almost all waiting on
+# other people's servers, so a big file wants a wide fan-out and a handful of
+# lines does not.
+BATCH_CONCURRENCY="${XTREAM_BATCH_CONCURRENCY:-}"
+JOBS_SET=""
+[[ -n $BATCH_CONCURRENCY ]] && JOBS_SET=1
 BATCH_CONNECT_TIMEOUT="${XTREAM_BATCH_CONNECT_TIMEOUT:-8}"
+# A single line is worth waiting 300s for; one line out of thousands is not —
+# a panel that trickles for five minutes would hold its slot the whole time.
+# --stats keeps the long budget, since it pulls whole catalogues.
+BATCH_TIMEOUT="${XTREAM_BATCH_TIMEOUT:-90}"
 SPEED_LIMIT="${XTREAM_SPEED_LIMIT:-1024}" # bytes/sec …
 SPEED_TIME="${XTREAM_SPEED_TIME:-30}"     # … sustained for this long = dead
 PROBE_TIMEOUT="${XTREAM_PROBE_TIMEOUT:-20}"
@@ -26,11 +36,26 @@ PROFILE="${XTREAM_PROFILE:-default}"
 KIND="live"
 REFRESH=""
 STATS=""
+ONLY=""           # --only: run just these line numbers of a dump
+PROBE_CODE=""     # last http_probe_stream result …
+PROBE_REASON=""   # … and a short reason ("HTTP 458", "placeholder")
+CATQ=""           # --category: restrict search/url to matching categories
+MUST=""           # --must: channels a line has to carry to be of any use
+TZQ=""            # --timezone: skip lines whose server sits somewhere else
+SHOW_ALL=""       # --all: keep the dead/refused rows in a batch listing
 STALKER=""        # set when the active line is a Stalker/Ministra portal
 STALKER_PORTAL=""
 STALKER_MAC=""
 
+OUT_FILE=""       # --out: mirror everything to this file
+XT_OUT_FIFO=""
+XT_OUT_PID=""
+
+# Captured once, up front: --out replaces stdout with a pipe, and later checks
+# would then think they are being piped and drop colours/alignment.
+ISATTY=""
 if [[ -t 1 ]]; then
+  ISATTY=1
   R=$'\033[31m' G=$'\033[32m' Y=$'\033[33m' B=$'\033[34m' D=$'\033[2m' N=$'\033[0m'
 else
   R="" G="" Y="" B="" D="" N=""
@@ -47,13 +72,155 @@ die() {
   exit 1
 }
 
+fmt_duration() {
+  local s="$1"
+  if ((s < 60)); then printf '%ds' "$s"
+  elif ((s < 3600)); then printf '%dm %02ds' "$((s / 60))" "$((s % 60))"
+  else printf '%dh %02dm %02ds' "$((s / 3600))" "$(((s % 3600) / 60))" "$((s % 60))"; fi
+}
+
+# Is "$1" the filename for -o, or the next argument? Guessing wrong would
+# silently write the run to a file named "search", so anything that looks like
+# a flag or a command means "no filename given, pick one".
+out_takes_value() {
+  case "${1:-}" in
+  "" | -*) return 1 ;;
+  status | quick | batch | lines | search | categories | cats | url | play | check | counts | save | raw | help)
+    return 1 ;;
+  esac
+  return 0
+}
+
+# Mirror everything this run prints — stdout and stderr — into a file, while
+# the terminal keeps its colours. One awk with two destinations rather than
+# `tee`, so the EXIT handler has a single pid to wait on and the file is
+# guaranteed complete when the command returns.
+setup_out() {
+  local f="${1:-}"
+  [[ -n $f ]] || f="xtream-$(date +%Y%m%d-%H%M%S).txt"
+  : >"$f" || die "cannot write $f"
+  OUT_FILE="$f"
+
+  # fd 9 stays attached to the terminal, so progress can be shown live
+  # without landing in the file.
+  exec 9>&2
+  XT_OUT_FIFO="$(mktemp -u "${TMPDIR:-/tmp}/xtream-out.XXXXXX")"
+  mkfifo "$XT_OUT_FIFO" || die "cannot create $XT_OUT_FIFO"
+  awk -v f="$f" -v esc="$(printf '\033')" '
+    { s = $0; gsub(esc "\\[[0-9;]*m", "", s); print s > f; fflush(f); print; fflush() }
+  ' <"$XT_OUT_FIFO" &
+  XT_OUT_PID=$!
+  exec >"$XT_OUT_FIFO" 2>&1
+  echo "${D}saving output to $f${N}"
+}
+
+# Always report the wall clock: these runs go from "instant, cached" to
+# "overnight over thousands of lines", and the number is the only way to tell
+# which one you just did.
+xtream_finish() {
+  local rc=$?
+  if [[ -n $ISATTY ]]; then
+    printf '%stook %s%s\n' "$D" "$(fmt_duration "$SECONDS")" "$N" >&2
+  fi
+  if [[ -n $XT_OUT_PID ]]; then
+    exec >&- 2>&-
+    wait "$XT_OUT_PID" 2>/dev/null || true
+    rm -f "$XT_OUT_FIFO"
+  fi
+  return $rc
+}
+trap xtream_finish EXIT
+
 usage() {
   cat <<'EOF'
 xtream — check an Xtream Codes IPTV line and search / play its channels.
 
 USAGE
+  xtream <FILE|CODE> [-n N] [command]    # work through a dump of many lines
   xtream <PLAYLIST-URL> [command]        # test a playlist you were just sent
   xtream [options] <command> [args]      # use a saved profile
+
+THE USUAL JOB — A FILE FULL OF LINES
+  1 · Which lines carry what you want, and can actually play it?
+
+      xtream lines.txt -z santiago -m tnt playable chile -o good.txt
+
+    The one pass that matters. Read it as: of every line in the file, keep the
+    ones on a Chilean server (-z), that carry channels matching "chile", that
+    have TNT among them (-m), and that will actually stream one. Ranked, best
+    first:
+
+       1. line 53 · someuser  1270 ch  must 1/1  exp 2026-10-11  conn 1/3  America/Santiago
+          GEO CHILE (REGIONAL) 1062 · ZAPPING CHILE 98 · FUTBÓL CHILE 34
+          http://panel.example.com:8080/get.php?username=someuser&password=…
+
+    The middle line is what it carries, by category and size — 1270 channels
+    are worth nothing if none of them is the football. Then the playlist URL,
+    and the same thing as the three fields a TV asks for, which is far less
+    typing on a remote:
+
+          tv: panel.example.com:8080  ·  someuser  ·  somepassword
+
+    http:// is left off because TV apps assume it and it is the worst part to
+    enter on a remote; if one refuses the address, put it back. https:// is
+    always shown, and the port never comes off. The three are URL-decoded
+    too, so a password written p%40ssw0rd in the dump shows as p@ssw0rd —
+    what you actually have to type.
+
+    The three filters, cheapest first:
+
+      -z RX   the server's own timezone (America/Santiago for a Chilean
+              panel). It comes from a tiny request, so lines that fail it
+              never download a catalogue — this is what makes a sweep over
+              thousands of lines quick. Expired lines are dropped here too.
+      QUERY   matches a channel's name OR its category, because panels split
+              evenly between "TNT CHILE PREMIUM HD" filed under DEPORTES and
+              "TNT SPORTS 1" filed under FUTBÓL CHILE. -C RX restricts to the
+              category alone when that is what you mean.
+      -m LIST what the line has to carry, comma-separated, each one a regex,
+              matched inside what QUERY already selected — which is what
+              makes it unambiguous: with `playable chile`, `-m tnt` is the
+              Chilean TNT, not the Argentinian one and not TNT the film
+              channel. All of them have to be there.
+
+    Everything else — wrong timezone, expired, no matching channels, missing a
+    must-have, listed but refuses to stream, host long dead — is counted and
+    left out, as are further accounts on a server already listed. -a keeps
+    every line and says which of those it was.
+
+  2 · What exactly does one of them carry?
+
+      xtream lines.txt -n 53 search chile           # every matching channel
+      xtream lines.txt -n 53 search 'tnt|espn'      # narrow it down
+
+    -n is the number from step 1, and takes @good.txt to mean "every line
+    that worked in that run".
+
+  3 · Does one particular channel really work?
+
+      xtream lines.txt -n 53 check 98
+
+    ffprobe against the real stream: codecs, resolution and frame rate if it
+    plays, and the panel's own reason if it doesn't (a placeholder loop, a
+    connection cap, a line barred from playback).
+
+  4 · Watch it before committing to it.
+
+      xtream lines.txt -n 53 play 98
+      xtream lines.txt -n 53 play 'tnt sports'      # a name works too
+
+  With a single line selected, every other command behaves exactly as if you
+  had handed xtream that line's URL:
+
+      xtream lines.txt -n 53 lines        # that line's own get.php URL
+      xtream lines.txt -n 53 quick        # status + categories + live count
+      xtream lines.txt -n 53 url 98       # direct stream link
+      xtream lines.txt -n 53 save chile   # keep it as a profile
+
+  To rank a whole dump without caring what it carries, `status` is cheaper —
+  it never downloads a catalogue:
+
+      xtream lines.txt --stats status -o run.txt
 
 TESTING A NEW PLAYLIST
   Paste the URL a provider gave you — get.php, player_api.php or a stream link.
@@ -71,13 +238,16 @@ TESTING A NEW PLAYLIST
   lands in shell history; in zsh a leading space keeps it out (HIST_IGNORE_SPACE).
 
 TESTING A SHARED DUMP (many lines at once)
-  IPTV lines get passed around as a base64 paste code (often a paste.sh link).
-  Hand that code — or the paste.sh URL — straight in and it decodes, decrypts,
-  and runs your command against every line:
+  IPTV lines get passed around as a base64 paste code (often a paste.sh link),
+  or just a text file full of URLs. Hand that code, the paste.sh URL, or a
+  local file straight in and it decodes/decrypts/reads it, then runs your
+  command against every line:
 
     xtream <base64-code>                      # status of every line
     xtream <base64-code> search chile         # search each active line
     xtream <base64-code> check 12345
+    xtream ~/Downloads/lines.txt              # a saved dump of get.php URLs
+    xtream ~/Downloads/lines.txt search chile
 
   Lines on a shared server hand out the same catalogue, so identical results
   are collapsed to "same as <first line>". Only active lines get the command.
@@ -86,21 +256,52 @@ TESTING A SHARED DUMP (many lines at once)
 
     xtream <base64-code> --stats
 
+WORKING THROUGH A BIG DUMP
+  The number in every row is the line's address for the rest of the session —
+  no grepping the file for a username:
+
+    xtream lines.txt lines                 # the index: which URL is line 3384
+    xtream lines.txt -n 3384 search chile  # one line
+    xtream lines.txt -n 1-50,3384 status   # ranges and lists work too
+
+  Results print as they land, so a long run shows rows all the way through.
+  Knobs for a file with thousands of lines:
+
+    -j N       how many lines to work on at the same time. Scales with the
+               dump on its own (16 → 48); pass it only to override
+    -T N       give up on a line after N seconds (default 90)
+    -o FILE    mirror the whole run into FILE as well as the terminal
+    --stats    slower: every line also downloads its full movie catalogue
+
+  Channel lists are cached for 6h per line, so a second pass over the same
+  dump is far cheaper than the first. Every run prints its wall-clock time.
+
   Stalker/Ministra portals (MAC-based, no username/password) are handled
   too — a paste with "Panel ➤ … / Mac ➤ …" blocks expands like any other,
   and status/search/check/url/counts all work per MAC.
 
 COMMANDS
   quick               Status + counts + categories (default for a bare URL)
-  batch <code> [cmd]  Expand a base64/paste.sh dump and run cmd on each line
+  batch <src> [cmd]   Expand a base64/paste.sh dump or a local file and run
+                      cmd on each line
+  lines               (batch) Numbered index of the dump: number, user, URL
   status              Account status: active/expired, expiry date, connections
-  search [QUERY]      List channels matching QUERY (case-insensitive regex).
-                      No QUERY lists everything.
+  search [QUERY]      List channels whose name or category matches QUERY
+                      (case-insensitive regex). No QUERY lists everything.
+                      -C restricts to the category alone.
   categories          List categories for the current type
   url <ID|QUERY>      Print the direct stream URL
-  play [QUERY]        Pick a channel (fzf) and play it in mpv
+  play <ID|QUERY>     Play it in mpv. An id or a query that matches one
+                      channel starts straight away; a wider query opens an
+                      fzf picker.
+  playable [QUERY]    Does this line carry these channels AND play them?
+                      Filters on -z / QUERY / -m, streams one of what is
+                      left, and lists what survived best first, with the URL
+                      to type into a TV
   check <ID|QUERY>    Probe the stream with ffprobe — is it really alive?
-  counts              How many live channels / movies / series the line carries
+  counts [WHAT…]      How many live channels / movies / series the line
+                      carries. Name what you want (live, movies, series) to
+                      skip the catalogues you don't.
   save [NAME]         Save the current line as profile NAME (default: "default")
   raw <ACTION>        Dump raw player_api.php JSON for ACTION (e.g. get_series)
 
@@ -110,6 +311,23 @@ OPTIONS
   -t, --type KIND     live (default) | vod | series
   -r, --refresh       Bypass the cached channel list
   -v, --stats         Batch status: add per-line live/movie counts (slower)
+  -C, --category RX   Only channels whose category matches RX (regex, case-
+                      insensitive). QUERY already matches categories too;
+                      use this when only the category will do
+  -m, --must LIST     playable: channels the line has to carry, comma-
+                      separated, each one a regex, all matched within what
+                      QUERY selected (`playable chile -m tnt` = Chilean TNT)
+  -z, --timezone RX   playable: keep lines whose server reports a matching
+                      timezone (e.g. santiago). Checked before any catalogue
+                      is downloaded, so it is what makes a big sweep quick
+  -n, --only SPEC     Batch: only these line numbers (12, 10-20, 1,5,900-905),
+                      or @FILE to take them from a run you already have
+  -a, --all           Batch: list the dead and refused lines too, not just
+                      the ones that worked
+  -j, --jobs N        Batch: how many lines to work on at the same time.
+                      Chosen from the size of the dump unless you set it.
+  -o, --out [FILE]    Also write everything to FILE (colours stripped).
+                      Without a name: xtream-YYYYmmdd-HHMMSS.txt
   -f, --force         Let `save` overwrite an existing profile
   -h, --help          This text
 
@@ -129,6 +347,12 @@ CONFIG
   Environment variables of the same name override the file.
 
 EXAMPLES
+  xtream lines.txt -z santiago -m tnt playable chile -o good.txt   # 1. the sweep
+  xtream lines.txt -n 53 search chile             # 2. what line 53 carries
+  xtream lines.txt -n 53 check 98                 # 3. does that channel work
+  xtream lines.txt -n 53 play 98                  # 4. watch it
+  xtream lines.txt --stats status -o run.txt      # rank the whole dump instead
+
   xtream 'http://host:8080/get.php?username=U&password=P'   # is this any good?
   xtream status
   xtream search 'espn|fox sports'
@@ -477,6 +701,13 @@ extract_xtream_urls() {
 resolve_batch_urls() {
   local input="$1" decoded text
 
+  # A local file of dumped lines (however many, in any of the shapes above) is
+  # scraped straight off disk — no fetch, no decode.
+  if [[ -f $input ]]; then
+    extract_xtream_urls <"$input"
+    return
+  fi
+
   decoded="$(maybe_base64_url "$input")" && input="$decoded"
 
   case "$input" in
@@ -499,7 +730,7 @@ resolve_batch_urls() {
     printf '%s\n' "$text" | extract_xtream_urls
     ;;
   *)
-    die "don't know how to expand that — pass a base64 paste code, a paste.sh URL, or a get.php URL"
+    die "don't know how to expand that — pass a base64 paste code, a paste.sh URL, a get.php URL, or a local file"
     ;;
   esac
 }
@@ -507,14 +738,262 @@ resolve_batch_urls() {
 # Run one batch line to stdout. Reads sub/fwd/STATS from the caller (cmd_batch)
 # via dynamic scope. With --stats on a status run, it also fetches counts so
 # the overview can show channel totals.
-batch_run_line() {
+run_line_once() {
   local url="$1"; shift
   if [[ $sub == status && -n ${STATS:-} ]]; then
     "$SELF" ${fwd[@]+"${fwd[@]}"} -u "$url" status
-    "$SELF" ${fwd[@]+"${fwd[@]}"} -u "$url" counts
+    # Only live/movies are shown, and every catalogue is a full download —
+    # asking for the series list too would double the cost of --stats.
+    "$SELF" ${fwd[@]+"${fwd[@]}"} -u "$url" counts live movies
   else
     "$SELF" ${fwd[@]+"${fwd[@]}"} -u "$url" "$sub" "$@"
   fi
+}
+
+# Servers under a burst of parallel requests hand back transient rejections
+# (503/511/timeouts). Each line retries its own once, so a rate-limit is not
+# mistaken for "line dead" — and, unlike a retry sweep after the fact, results
+# stay final as they land, which is what lets the parent stream them in order.
+batch_run_line() {
+  local url="$1"; shift
+  local out
+  out="$(run_line_once "$url" "$@" 2>&1)" || true
+  # Only what a burst of parallel requests can cause is worth a second go. A
+  # host that doesn't resolve or refuses the connection is simply gone, and
+  # retrying it doubles the cost of the bulk of a stale dump for nothing.
+  if grep -qE 'curl: \(|request failed|server rejected|timed out' <<<"$out" &&
+    ! grep -qE 'cannot resolve host|cannot connect to' <<<"$out"; then
+    out="$(run_line_once "$url" "$@" 2>&1)" || true
+    : >"$tmp/$i.retry"
+  fi
+  printf '%s\n' "$out"
+}
+
+# Expand a --only spec ("12", "3384", "10-20", "1,5,900-905") to line numbers.
+expand_only() {
+  local spec="$1" tok a b
+
+  # -n @FILE: carry on from a run you already have —
+  #   xtream dump.txt -C chile playable -o good.txt
+  #   xtream dump.txt -n @good.txt -C chile search
+  if [[ $spec == @* ]]; then
+    local f="${spec#@}" nums
+    [[ -r $f ]] || die "cannot read '$f' (from -n @FILE)"
+    # A result row is "  3384. user …"; the digits-then-dot is what tells it
+    # apart from the header and summary lines in the same file. Rows that
+    # record a failure are dropped, so a file saved with -a (or by an older
+    # version, when every line was listed) needs no filtering first.
+    nums="$(grep -vE 'unreachable|rejected|refused|placeholder|no response|no matching|HTTP [0-9]{3}|Expired|Banned|Disabled' "$f" |
+      sed -n 's/^[[:space:]]*\([0-9][0-9]*\)\..*/\1/p')"
+    # …and a plain list of numbers works too.
+    [[ -n $nums ]] || nums="$(grep -oE '^[[:space:]]*[0-9]+[[:space:]]*$' "$f" | tr -d '[:space:]' || true)"
+    [[ -n $nums ]] || die "no line numbers found in '$f'"
+    printf '%s\n' "$nums"
+    return
+  fi
+
+  local IFS=','
+  for tok in $spec; do
+    if [[ $tok =~ ^[0-9]+$ ]]; then
+      printf '%s\n' "$tok"
+    elif [[ $tok =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[2]}"
+      ((a <= b)) || die "--only range '$tok' runs backwards"
+      for ((; a <= b; a++)); do printf '%s\n' "$a"; done
+    else
+      die "bad --only '$tok' — use N, N-M or a comma-separated list"
+    fi
+  done
+}
+
+# Nobody should have to guess a number here. The run is bound by how long
+# other people's panels take to answer — dead lines burn the connect timeout
+# twice — so wider is better the moment a dump gets big, while a handful of
+# lines gains nothing from fanning out.
+batch_autoscale() {
+  [[ -z $JOBS_SET ]] || return 0
+  local total="$1"
+  if ((total <= 64)); then BATCH_CONCURRENCY=16
+  elif ((total <= 512)); then BATCH_CONCURRENCY=32
+  else BATCH_CONCURRENCY=48; fi
+  ((BATCH_CONCURRENCY <= total)) || BATCH_CONCURRENCY=$total
+}
+
+# A "1234/3421 done" ticker for runs whose results only print at the end.
+# Silent when the output is being captured, so no \r junk lands in a file.
+batch_progress() {
+  [[ -n $ISATTY ]] || return 0
+  if [[ -n $OUT_FILE ]]; then
+    printf '\r\033[2K  %s%d/%d done%s' "$D" "$1" "$2" "$N" >&9
+  else
+    printf '\r\033[2K  %s%d/%d done%s' "$D" "$1" "$2" "$N" >&2
+  fi
+}
+
+batch_progress_clear() {
+  [[ -n $ISATTY ]] || return 0
+  if [[ -n $OUT_FILE ]]; then printf '\r\033[2K' >&9; else printf '\r\033[2K' >&2; fi
+}
+
+# One compact row per account, printed the moment that line finishes. Reads
+# urls/idx/tmp/STATS and the n_* tallies from cmd_batch via dynamic scope.
+render_status_row() {
+  local pos="$1"
+  local u="${urls[$((pos - 1))]}" n="${idx[$((pos - 1))]}"
+  local user out st exp cons live movies colour
+  user="$(batch_label "$u")"
+  out="$(cat "$tmp/$pos.done" 2>/dev/null || true)"
+
+  if ! grep -q '^status ' <<<"$out"; then
+    n_dead=$((n_dead + 1))
+    [[ -n $SHOW_ALL ]] || return 0
+    batch_progress_clear
+    printf '  %4d. %-22s %s\n' "$n" "${user:-?}" "${R}unreachable/rejected${N}"
+    return
+  fi
+
+  st="$(sed -n 's/^status *//p' <<<"$out" | sed 's/\x1b\[[0-9;]*m//g')"
+  exp="$(sed -n 's/^expires *//p' <<<"$out" | sed 's/  .*//')"
+  cons="$(sed -n 's/^connections *//p' <<<"$out")"
+  cons="${cons:--}" # Stalker portals report no connection count
+  colour="$G"
+  if [[ $st == Active ]]; then
+    n_active=$((n_active + 1))
+  else
+    colour="$R"
+    n_expired=$((n_expired + 1))
+    [[ -n $SHOW_ALL ]] || return 0
+  fi
+  batch_progress_clear
+
+  if [[ -n $STATS ]]; then
+    live="$(sed -n 's/^live *//p' <<<"$out")"
+    movies="$(sed -n 's/^movies *//p' <<<"$out")"
+    printf '  %4d. %-22s %b%-8s%b exp %s  conn %-5s  live %-6s movies %s\n' \
+      "$n" "${user:-?}" "$colour" "$st" "$N" "$exp" "$cons" "${live:-?}" "${movies:-?}"
+  else
+    printf '  %4d. %-22s %b%-8s%b exp %s  conn %s\n' \
+      "$n" "${user:-?}" "$colour" "$st" "$N" "$exp" "$cons"
+  fi
+}
+
+render_playable_row() {
+  local pos="$1"
+  local u="${urls[$((pos - 1))]}" n="${idx[$((pos - 1))]}"
+  local user out verdict reason matches must host
+
+  user="$(batch_label "$u")"
+  out="$(cat "$tmp/$pos.done" 2>/dev/null || true)"
+
+  if ! grep -q '^playable ' <<<"$out"; then
+    n_dead=$((n_dead + 1))
+    [[ -n $SHOW_ALL ]] || return 0
+    batch_progress_clear
+    printf '  %4d. %-22s %s\n' "$n" "${user:-?}" "${R}unreachable/rejected${N}"
+    return 0
+  fi
+
+  verdict="$(sed -n 's/^playable *//p' <<<"$out")"
+  matches="$(sed -n 's/^matches *//p' <<<"$out")"
+  must="$(sed -n 's/^must *//p' <<<"$out")"
+  reason="$(sed -n 's/^reason *//p' <<<"$out")"
+
+  if [[ $verdict != yes ]]; then
+    n_expired=$((n_expired + 1))
+    [[ -n $SHOW_ALL ]] || return 0
+    batch_progress_clear
+    printf '  %4d. %-22s %b%s%b\n' "$n" "${user:-?}" "$R" "${reason:-refused}" "$N"
+    return 0
+  fi
+
+  n_active=$((n_active + 1))
+
+  # Accounts on one server hand out the same catalogue, and any one of them is
+  # as good as the others for typing into a TV. Keep the first that works and
+  # count the rest. (A plain string, not an associative array — bash 3.2.)
+  host="${u#*://}"; host="${host%%/*}"
+  case "$u" in
+  https://*) host="${host%:443}" ;;
+  *) host="${host%:80}" ;;
+  esac
+  if [[ -z $SHOW_ALL && $seen_hosts == *" $host "* ]]; then
+    n_dup=$((n_dup + 1))
+    return 0
+  fi
+  seen_hosts="$seen_hosts$host "
+
+  # Sort keys first, so the ranked listing at the end can be built from the
+  # files still on disk: must-haves matched, then how much it carries.
+  rank_keys+=("${must%%/*}0 $matches $pos")
+
+  batch_progress_clear
+  render_playable_detail "" "$pos"
+}
+
+# The payoff, printed once the sweep is done: what each line carries, how long
+# it lasts, and the string to type into the TV — best first.
+render_playable_detail() {
+  local rank="$1" pos="$2"
+  local u="${urls[$((pos - 1))]}" n="${idx[$((pos - 1))]}"
+  local out matches must sample exp cons tz user lead srv usr pw alias
+  user="$(batch_label "$u")"
+  out="$(cat "$tmp/$pos.done" 2>/dev/null || true)"
+  matches="$(sed -n 's/^matches *//p' <<<"$out")"
+  must="$(sed -n 's/^must *//p' <<<"$out")"
+  sample="$(sed -n 's/^sample *//p' <<<"$out")"
+  exp="$(sed -n 's/^expires *//p' <<<"$out")"
+  cons="$(sed -n 's/^conns *//p' <<<"$out")"
+  tz="$(sed -n 's/^tz *//p' <<<"$out")"
+  srv="$(sed -n 's/^server *//p' <<<"$out")"
+  alias="$(sed -n 's/^alias *//p' <<<"$out")"
+  usr="$(sed -n 's/^user *//p' <<<"$out")"
+  pw="$(sed -n 's/^pass *//p' <<<"$out")"
+
+  # The ranked listing at the end numbers its entries; a hit printed as it is
+  # found just says which line it is.
+  if [[ -n $rank ]]; then lead="$(printf '%3d. ' "$rank")"; else lead="     "; fi
+
+  printf '%s%bline %d · %s%b  %s ch%s%s%s%s\n' \
+    "$lead" "$B" "$n" "$user" "$N" "${matches:-?}" \
+    "${must:+  must $must}" "${exp:+  exp $exp}" "${cons:+  conn $cons}" \
+    "${tz:+  $tz}"
+  printf '     %s%s%s\n' "$D" "$sample" "$N"
+  printf '     %s\n' "$u"
+  # Typing this into a TV is the last step, and the three fields are what it
+  # asks for. http:// comes off — TV apps assume it, and it is the most
+  # tedious part to enter on a remote. https:// stays, since dropping that one
+  # changes what you connect to. The port never comes off.
+  if [[ -n $srv ]]; then
+    case "$srv" in
+    http://*) srv="${srv#http://}" ;;
+    esac
+    printf '     %stv:%s %s  ·  %s  ·  %s%s\n' "$D" "$N" "$srv" "$usr" "$pw" \
+      "${alias:+  ${D}(panel calls itself $alias)${N}}"
+  fi
+  return 0
+}
+
+render_counts_row() {
+  local pos="$1"
+  local u="${urls[$((pos - 1))]}" n="${idx[$((pos - 1))]}"
+  local user out live movies series
+  user="$(batch_label "$u")"
+  out="$(cat "$tmp/$pos.done" 2>/dev/null || true)"
+
+  if ! grep -q '^live ' <<<"$out"; then
+    n_dead=$((n_dead + 1))
+    [[ -n $SHOW_ALL ]] || return 0
+    batch_progress_clear
+    printf '  %4d. %-22s %s\n' "$n" "${user:-?}" "${R}unreachable/rejected${N}"
+    return
+  fi
+  n_active=$((n_active + 1))
+  batch_progress_clear
+  live="$(sed -n 's/^live *//p' <<<"$out")"
+  movies="$(sed -n 's/^movies *//p' <<<"$out")"
+  series="$(sed -n 's/^series *//p' <<<"$out")"
+  printf '  %4d. %-22s live %-7s movies %-7s series %s\n' \
+    "$n" "${user:-?}" "$live" "$movies" "$series"
 }
 
 # A short label for a batch line: the Xtream username, or the MAC for a
@@ -527,7 +1006,7 @@ batch_label() {
 }
 
 cmd_batch() {
-  [[ -n ${1:-} ]] || die "usage: xtream batch <base64-code|paste.sh URL> [command] [args]"
+  [[ -n ${1:-} ]] || die "usage: xtream batch <base64-code|paste.sh URL|file> [command] [args]"
   local input="$1"
   shift
 
@@ -538,9 +1017,20 @@ cmd_batch() {
     -v | --stats) STATS=1; shift ;;
     -r | --refresh) REFRESH=1; shift ;;
     -t | --type) KIND="${2:?--type needs live|vod|series}"; shift 2 ;;
+    -j | --jobs) BATCH_CONCURRENCY="${2:?--jobs needs a number}"; JOBS_SET=1; shift 2 ;;
+    -n | --only) ONLY="${2:?--only needs a line number, range or list}"; shift 2 ;;
+    -C | --category) CATQ="${2:?--category needs a regex}"; shift 2 ;;
+    -m | --must) MUST="${2:?--must needs a channel name (or a comma-separated list)}"; shift 2 ;;
+    -z | --timezone) TZQ="${2:?--timezone needs a regex, e.g. santiago}"; shift 2 ;;
+    -a | --all) SHOW_ALL=1; shift ;;
+    -o | --out)
+      if out_takes_value "${2:-}"; then setup_out "$2"; shift 2; else setup_out ""; shift; fi ;;
     -c | --connect-timeout)
       CONNECT_TIMEOUT="${2:?--connect-timeout needs seconds}"
       BATCH_CONNECT_TIMEOUT="$2"; shift 2 ;;
+    -T | --timeout)
+      TIMEOUT="${2:?--timeout needs seconds}"
+      BATCH_TIMEOUT="$2"; shift 2 ;;
     *) die "unknown batch option '$1' (try --help)" ;;
     esac
   done
@@ -548,110 +1038,181 @@ cmd_batch() {
   local sub="${1:-status}"
   [[ $# -gt 0 ]] && shift
 
-  local urls=()
-  local line
-  while IFS= read -r line; do [[ -n $line ]] && urls+=("$line"); done < <(resolve_batch_urls "$input")
+  local -a all=() urls=() idx=()
+  local line k
+  while IFS= read -r line; do [[ -n $line ]] && all+=("$line"); done < <(resolve_batch_urls "$input")
 
-  ((${#urls[@]})) || die "no Xtream lines found in that input"
+  ((${#all[@]})) || die "no Xtream lines found in that input"
+
+  # --only keeps the numbering of the full run, so `--only 3384` reports line
+  # 3384 exactly as it was labelled when the whole dump went through.
+  if [[ -n ${ONLY:-} ]]; then
+    for k in $(expand_only "$ONLY"); do
+      ((k >= 1 && k <= ${#all[@]})) || die "--only $k is out of range (1-${#all[@]})"
+      urls+=("${all[$((k - 1))]}"); idx+=("$k")
+    done
+  else
+    for k in $(seq 1 ${#all[@]}); do urls+=("${all[$((k - 1))]}"); idx+=("$k"); done
+  fi
+
+  # `lines` is the index of the dump: which URL is line N. No network at all,
+  # so it answers instantly even for a file with thousands of lines.
+  if [[ $sub == lines ]]; then
+    for k in $(seq 1 ${#urls[@]}); do
+      # `xtream dump.txt lines | head` closes the pipe under us; that is not an
+      # error worth printing.
+      printf '  %4d. %-22s %s\n' \
+        "${idx[$((k - 1))]}" "$(batch_label "${urls[$((k - 1))]}")" "${urls[$((k - 1))]}" 2>/dev/null || exit 0
+    done
+    return
+  fi
+
+  # One line selected — almost always `-n N` — is not a batch at all. Run it
+  # here, in this shell, so it behaves exactly like handing xtream that line's
+  # URL: full status block, working picker, mpv on the terminal, raw URL on
+  # stdout. The batch machinery would fork it into a pipe and strand anything
+  # interactive.
+  if ((${#urls[@]} == 1)); then
+    local host="${urls[0]#*://}"; host="${host%%/*}"
+    [[ -n $ISATTY ]] && echo "${D}line ${idx[0]} · $(batch_label "${urls[0]}") · ${host}${N}" >&2
+    URL_OVERRIDE="${urls[0]}"
+    load_config
+    run_command "$sub" "$@"
+    return
+  fi
+
+  [[ $sub != play ]] || die "play needs one line — pick it with -n N (see 'xtream $input lines')"
 
   # Pass our own -t/-r flags through to each sub-invocation. Batch lines fail
   # fast on a dead host — no point waiting the full single-line connect budget.
   local -a fwd=(-c "$BATCH_CONNECT_TIMEOUT")
+  [[ -z $STATS ]] && fwd+=(-T "$BATCH_TIMEOUT")
+  [[ -n $CATQ ]] && fwd+=(-C "$CATQ")
+  [[ -n $MUST ]] && fwd+=(-m "$MUST")
+  [[ -n $TZQ ]] && fwd+=(-z "$TZQ")
   [[ $KIND != live ]] && fwd+=(-t "$KIND")
   [[ -n $REFRESH ]] && fwd+=(-r)
 
-  echo "${D}${#urls[@]} line(s) · running '$sub' in parallel${N}"
+  local total=${#urls[@]}
+  batch_autoscale "$total"
+  echo "${D}${total} line(s) · running '$sub' · ${BATCH_CONCURRENCY} at a time${JOBS_SET:+ (-j)}${N}"
 
-  # Run every line concurrently into its own temp file. The lines are
-  # independent, so wall-clock collapses to the slowest single line instead of
-  # the sum. Cap the fan-out so a huge dump doesn't open hundreds of sockets.
+  # Run the lines concurrently, each into its own temp file, keeping the slots
+  # topped up rather than waiting for a whole round to drain — one slow line
+  # then costs one slot, not the whole batch. Results are rendered in order as
+  # they land, so a run over thousands of lines shows rows all the way through
+  # instead of nothing until the end.
   local tmp
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/xtream-batch.XXXXXX")"
-  local i=0 u running=0
-  for u in "${urls[@]}"; do
-    i=$((i + 1))
-    ( batch_run_line "$u" "$@" >"$tmp/$i.out" 2>&1 || true ) &
-    running=$((running + 1))
-    if ((running >= BATCH_CONCURRENCY)); then wait; running=0; fi
-  done
-  wait
+  local i=0 r=0 k
+  local n_active=0 n_expired=0 n_dead=0 n_dup=0
+  local seen_hosts=" "
+  local -a rank_keys=()
+  local streaming=""
+  [[ $sub == status || $sub == counts || $sub == playable ]] && streaming=1
 
-  # Servers under a burst of parallel requests hand back transient rejections
-  # (503/511/timeouts). Retry only those, one at a time, so a rate-limit
-  # doesn't get mistaken for "line dead" or "channel absent".
-  local retried=0
-  for i in $(seq 1 "${#urls[@]}"); do
-    if grep -qE 'curl: \(|request failed|server rejected|timed out' "$tmp/$i.out" 2>/dev/null; then
-      batch_run_line "${urls[$((i - 1))]}" "$@" >"$tmp/$i.out" 2>&1 || true
-      retried=$((retried + 1))
+  # In-flight workers, tracked by hand. `jobs` cannot do it: a command
+  # substitution runs in a subshell with an empty job table, so `$(jobs -pr)`
+  # always came back empty and every line launched at once — a few thousand
+  # processes against a 4000 cap, which is where "fork: Resource temporarily
+  # unavailable" came from. A worker is finished when its .done file appears;
+  # both tests below are builtins, so polling costs no processes at all.
+  local -a live_idx=() live_pid=() keep_idx=() keep_pid=()
+
+  while ((r < total)); do
+    while ((i < total)) && ((${#live_idx[@]} < BATCH_CONCURRENCY)); do
+      i=$((i + 1))
+      (
+        batch_run_line "${urls[$((i - 1))]}" "$@" >"$tmp/$i.out" 2>&1 || true
+        mv -f "$tmp/$i.out" "$tmp/$i.done"
+      ) &
+      live_idx+=("$i")
+      live_pid+=("$!")
+    done
+
+    keep_idx=(); keep_pid=()
+    for k in ${live_idx[@]+"${!live_idx[@]}"}; do
+      if [[ -e $tmp/${live_idx[$k]}.done ]]; then
+        continue
+      elif ! kill -0 "${live_pid[$k]}" 2>/dev/null; then
+        # Gone without leaving a result — a worker that could not start, or
+        # was killed. Record the empty answer so the run isn't stuck on it.
+        : >"$tmp/${live_idx[$k]}.done"
+        continue
+      fi
+      keep_idx+=("${live_idx[$k]}")
+      keep_pid+=("${live_pid[$k]}")
+    done
+    live_idx=(${keep_idx[@]+"${keep_idx[@]}"})
+    live_pid=(${keep_pid[@]+"${keep_pid[@]}"})
+
+    while ((r < total)) && [[ -e $tmp/$((r + 1)).done ]]; do
+      r=$((r + 1))
+      case "$sub" in
+      status) render_status_row "$r" ;;
+      counts) render_counts_row "$r" ;;
+      playable) render_playable_row "$r" ;;
+      esac
+    done
+
+    if ((r < total)); then
+      batch_progress "$r" "$total"
+      sleep 0.2
     fi
   done
+  for k in ${live_pid[@]+"${live_pid[@]}"}; do wait "$k" 2>/dev/null || true; done
+  batch_progress_clear
+
+  local retried=0
+  retried="$(ls "$tmp" 2>/dev/null | grep -c '\.retry$' || true)"
+
+  local out sig n user host
+
+  # The winners, best first. Built from the result files, which is why this
+  # runs before the temp directory goes away.
+  if [[ $sub == playable ]] && ((${#rank_keys[@]})); then
+    local rank=0 rk_pos
+    echo
+    echo "${D}── best first${N}"
+    while read -r _ _ rk_pos; do
+      [[ -n $rk_pos ]] || continue
+      rank=$((rank + 1))
+      render_playable_detail "$rank" "$rk_pos"
+    done < <(printf '%s\n' "${rank_keys[@]}" | sort -k1,1nr -k2,2nr)
+  fi
+
+  # status/counts rows have already streamed out; close with the tallies.
+  if [[ -n $streaming ]]; then
+    echo
+    if [[ $sub == status ]]; then
+      echo "${D}── $total lines · ${n_active} active · ${n_expired} expired/blocked · ${n_dead} dead${N}"
+    elif [[ $sub == playable ]]; then
+      echo "${D}── $total lines · ${n_active} play · ${n_expired} refused · ${n_dead} dead${N}"
+      ((n_dup == 0)) || echo "${D}   ${n_dup} of those repeat a server already listed${N}"
+    else
+      echo "${D}── $total lines · ${n_active} answered · ${n_dead} dead${N}"
+    fi
+    [[ -n $SHOW_ALL ]] || ((n_expired + n_dead == 0)) ||
+      echo "${D}   $((n_expired + n_dead)) line(s) not shown — -a lists them too${N}"
+    ((retried)) && echo "${D}   retried $retried rate-limited line(s)${N}"
+    rm -rf "$tmp"
+    return
+  fi
+
   ((retried)) && echo "${D}retried $retried rate-limited line(s)${N}"
-
-  local out sig match n user host
-
-  # status → one compact line per account; anything else → grouped results
-  # with byte-identical catalogues folded to "same as <line>".
-  if [[ $sub == status ]]; then
-    local st exp cons live movies
-    for i in $(seq 1 "${#urls[@]}"); do
-      u="${urls[$((i - 1))]}"
-      user="$(batch_label "$u")"
-      out="$(cat "$tmp/$i.out" 2>/dev/null)"
-      if ! grep -q '^status ' <<<"$out"; then
-        printf '  %2d. %-22s %s\n' "$i" "${user:-?}" "${R}unreachable/rejected${N}"
-        continue
-      fi
-      st="$(sed -n 's/^status *//p' <<<"$out" | sed 's/\x1b\[[0-9;]*m//g')"
-      exp="$(sed -n 's/^expires *//p' <<<"$out" | sed 's/  .*//')"
-      cons="$(sed -n 's/^connections *//p' <<<"$out")"
-      cons="${cons:--}"   # Stalker portals report no connection count
-      local colour="$G"
-      [[ $st == Active ]] || colour="$R"
-      if [[ -n $STATS ]]; then
-        live="$(sed -n 's/^live *//p' <<<"$out")"
-        movies="$(sed -n 's/^movies *//p' <<<"$out")"
-        printf '  %2d. %-22s %b%-8s%b exp %s  conn %-5s  live %-6s movies %s\n' \
-          "$i" "${user:-?}" "$colour" "$st" "$N" "$exp" "$cons" "${live:-?}" "${movies:-?}"
-      else
-        printf '  %2d. %-22s %b%-8s%b exp %s  conn %s\n' \
-          "$i" "${user:-?}" "$colour" "$st" "$N" "$exp" "$cons"
-      fi
-    done
-    rm -rf "$tmp"
-    return
-  fi
-
-  # counts → a compact live/movies/series table, one row per account.
-  if [[ $sub == counts ]]; then
-    local live movies series
-    for i in $(seq 1 "${#urls[@]}"); do
-      u="${urls[$((i - 1))]}"
-      user="$(batch_label "$u")"
-      out="$(cat "$tmp/$i.out" 2>/dev/null)"
-      if ! grep -q '^live ' <<<"$out"; then
-        printf '  %2d. %-22s %s\n' "$i" "${user:-?}" "${R}unreachable/rejected${N}"
-        continue
-      fi
-      live="$(sed -n 's/^live *//p' <<<"$out")"
-      movies="$(sed -n 's/^movies *//p' <<<"$out")"
-      series="$(sed -n 's/^series *//p' <<<"$out")"
-      printf '  %2d. %-22s live %-7s movies %-7s series %s\n' \
-        "$i" "${user:-?}" "$live" "$movies" "$series"
-    done
-    rm -rf "$tmp"
-    return
-  fi
 
   # Group byte-identical results (a shared server repeats the same catalogue
   # under every account), classify each line, and tally for the summary.
   local -a g_sig=() g_label=() g_host=() g_out=() g_cat=() g_also=() err_labels=()
-  local n_ok=0 n_empty=0 n_err=0 cat gi k
-  for i in $(seq 1 "${#urls[@]}"); do
+  local n_ok=0 n_empty=0 n_err=0 cat gi u
+  for i in $(seq 1 "$total"); do
     u="${urls[$((i - 1))]}"
-    user="$(batch_label "$u")"
+    n="${idx[$((i - 1))]}"
+    # Braces are load-bearing: bash 3.2 reads the bytes of "·" as part of the
+    # variable name in a bare "$n·".
+    user="${n}·$(batch_label "$u")"
     host="${u#*://}"; host="${host%%/*}"
-    out="$(cat "$tmp/$i.out" 2>/dev/null)"
+    out="$(cat "$tmp/$i.done" 2>/dev/null)"
     sig="$(printf '%s' "$out" | hash_text)"
 
     if grep -qE 'curl: \(|request failed|server rejected|timed out|authentication rejected|no channel list' <<<"$out"; then
@@ -679,6 +1240,7 @@ cmd_batch() {
     cat="${g_cat[$k]}"
     # For search, a "no match" line is just noise — count it, don't print it.
     [[ $sub == search && $cat == EMPTY ]] && continue
+    [[ $cat == ERR && -z $SHOW_ALL ]] && continue
     also="${g_also[$k]# }"
     echo
     case "$cat" in
@@ -700,10 +1262,15 @@ cmd_batch() {
   done
 
   echo
-  echo "${D}── ${#urls[@]} lines · ${n_ok} matched · ${n_empty} no match · ${n_err} dead${N}"
+  echo "${D}── $total lines · ${n_ok} matched · ${n_empty} no match · ${n_err} dead${N}"
   if ((n_err)); then
-    local joined=""
-    for k in "${err_labels[@]}"; do joined="${joined:+$joined, }$k"; done
+    # Naming every dead line is unreadable once a dump runs to thousands.
+    local joined="" shown=0
+    for k in "${err_labels[@]}"; do
+      ((shown < 20)) || { joined="$joined, … and $((n_err - shown)) more"; break; }
+      joined="${joined:+$joined, }$k"
+      shown=$((shown + 1))
+    done
     echo "${D}   dead: ${joined}${N}"
   fi
 
@@ -892,13 +1459,18 @@ list_streams() {
   jq -e . >/dev/null 2>&1 <<<"$streams" || die "line returned no channel list (rejected or offline)"
   jq -e . >/dev/null 2>&1 <<<"$cats" || cats="[]"
 
-  jq -r --arg q "$query" --argjson cats "$cats" '
+  jq -r --arg q "$query" --arg cq "$CATQ" --argjson cats "$cats" '
     ($cats | map({key: (.category_id | tostring), value: .category_name}) | from_entries) as $cmap
     | .[]
-    | select($q == "" or (.name | test($q; "i")))
-    | [ (.stream_id // .series_id // .num | tostring),
-        .name,
-        ($cmap[(.category_id | tostring)] // "-") ]
+    | . as $s
+    | (($cmap[($s.category_id | tostring)]) // "-") as $cname
+    # A query matches the name or the category: half these panels file the
+    # Chilean football under DEPORTES and put CHILE in the channel name, the
+    # other half do the reverse. -C stays category-only for when that is
+    # exactly what you mean.
+    | select($q == "" or ($s.name | test($q; "i")) or ($cname | test($q; "i")))
+    | select($cq == "" or ($cname | test($cq; "i")))
+    | [ ($s.stream_id // $s.series_id // $s.num | tostring), $s.name, $cname ]
     | @tsv
   ' <<<"$streams"
 }
@@ -1035,19 +1607,37 @@ cmd_status() {
   fi
 }
 
+# counts [live|movies|series ...] — each catalogue is a separate full
+# download, so being able to ask for only the ones you want is the difference
+# between one request and three on a big panel.
 cmd_counts() {
   if [[ -n ${STALKER:-} ]]; then
     stalker_run counts
     return
   fi
-  local live vod series
-  live="$(api_cached get_live_streams)" || exit 1
-  vod="$(api_cached get_vod_streams)" || exit 1
-  series="$(api_cached get_series)" || exit 1
+  local -a want=()
+  local a data
+  for a in "$@"; do
+    case "$a" in
+    live | movies | series) want+=("$a") ;;
+    *) die "usage: xtream counts [live|movies|series ...]" ;;
+    esac
+  done
+  ((${#want[@]})) || want=(live movies series)
 
-  printf 'live    %s\n' "$(jq 'length' <<<"$live")"
-  printf 'movies  %s\n' "$(jq 'length' <<<"$vod")"
-  printf 'series  %s\n' "$(jq 'length' <<<"$series")"
+  for a in "${want[@]}"; do
+    case "$a" in
+    live)
+      data="$(api_cached get_live_streams)" || exit 1
+      printf 'live    %s\n' "$(jq 'length' <<<"$data")" ;;
+    movies)
+      data="$(api_cached get_vod_streams)" || exit 1
+      printf 'movies  %s\n' "$(jq 'length' <<<"$data")" ;;
+    series)
+      data="$(api_cached get_series)" || exit 1
+      printf 'series  %s\n' "$(jq 'length' <<<"$data")" ;;
+    esac
+  done
 }
 
 cmd_search() {
@@ -1056,9 +1646,14 @@ cmd_search() {
     out="$(stalker_run search "${1:-}")" || exit 1
   else
     out="$(list_streams "${1:-}")" || exit 1
-    [[ -n $out ]] || die "no $KIND channel matches '${1:-}'"
+    if [[ -z $out ]]; then
+      local msg="no $KIND channel matches"
+      [[ -n ${1:-} ]] && msg="$msg '$1'"
+      [[ -n $CATQ ]] && msg="$msg in a category like /$CATQ/"
+      die "$msg"
+    fi
   fi
-  if [[ -t 1 ]]; then
+  if [[ -n $ISATTY ]]; then
     tabulate <<<"$out"
   else
     printf '%s\n' "$out"
@@ -1069,7 +1664,7 @@ cmd_categories() {
   local out
   out="$(api_cached "$(categories_action)")" || exit 1
   out="$(jq -r '.[] | [.category_id, .category_name] | @tsv' <<<"$out")"
-  if [[ -t 1 ]]; then
+  if [[ -n $ISATTY ]]; then
     tabulate <<<"$out"
   else
     printf '%s\n' "$out"
@@ -1088,36 +1683,242 @@ cmd_url() {
   echo
 }
 
+# play <ID|QUERY> — an id plays straight away, a query that matches one
+# channel does too, and only a genuine choice opens the picker.
 cmd_play() {
   need mpv
-  need fzf
-  [[ -t 0 ]] || die "play needs a terminal for the picker — use 'xtream url' and pipe that to mpv"
-  local list pick id url
-  if [[ -n ${STALKER:-} ]]; then
-    list="$(stalker_run search "${1:-}")" || exit 1
+  local list pick id url name
+
+  if [[ ${1:-} =~ ^[0-9]+$ ]]; then
+    id="$1"
+    name="stream $1"
   else
-    list="$(list_streams "${1:-}")" || exit 1
-    [[ -n $list ]] || die "no $KIND channel matches '${1:-}'"
+    if [[ -n ${STALKER:-} ]]; then
+      list="$(stalker_run search "${1:-}")" || exit 1
+    else
+      list="$(list_streams "${1:-}")" || exit 1
+      [[ -n $list ]] || die "no $KIND channel matches '${1:-}'"
+    fi
+
+    if [[ $(grep -c . <<<"$list") -eq 1 ]]; then
+      pick="$list"
+    else
+      need fzf
+      [[ -t 0 ]] || die "several channels match — pass a stream id, or run this in a terminal to pick one"
+      pick="$(fzf --with-nth=2.. --delimiter='\t' --prompt="stream> " <<<"$list" || true)"
+      [[ -n $pick ]] || exit 0
+    fi
+    id="$(cut -f1 <<<"$pick")"
+    name="$(cut -f2 <<<"$pick")"
   fi
 
-  pick="$(fzf --with-nth=2.. --delimiter='\t' --prompt="stream> " <<<"$list" || true)"
-  [[ -n $pick ]] || exit 0
-
-  id="$(cut -f1 <<<"$pick")"
   if [[ -n ${STALKER:-} ]]; then
     url="$(stalker_run url "$id")" || exit 1
   else
     url="$(stream_url "$id")" || exit 1
   fi
-  echo "${B}▶${N} $(cut -f2 <<<"$pick")"
-  mpv --really-quiet "$url"
+
+  # A refused stream would otherwise be a player that opens and closes with
+  # nothing said — the panel's reason is the useful part.
+  http_probe_stream "$url" "$id" || exit 1
+
+  echo "${B}▶${N} $name"
+  local rc=0
+  mpv --quiet "$url" || rc=$?
+  if ((rc != 0)); then
+    echo "${R}✗ mpv exited $rc${N} — the panel let the request through but the stream did not play" >&2
+    echo "  ${D}xtream … check $id  says what the stream itself is doing${N}" >&2
+    exit 1
+  fi
+}
+
+# Ask the server about a stream before a player or ffprobe touches it: both
+# turn a panel's refusal into either silence or "4XX Client Error, but not one
+# of 40{0,1,3,4}", which says nothing. Prints the verdict; non-zero when the
+# panel is refusing.
+http_probe_stream() {
+  local url="$1" id="$2" quiet="${3:-}" probe code redir
+
+  # -L: panels commonly answer with a 302 to a tokenised URL on another host,
+  # and the status that matters is the one at the end of that chain.
+  probe="$(curl -sL --max-redirs 5 -o /dev/null -w '%{http_code} %{url_effective}' \
+    --connect-timeout "$CONNECT_TIMEOUT" --max-time 10 -r 0-1024 "$url" 2>/dev/null || true)"
+  code="${probe%% *}"
+  redir="${probe#* }"
+  PROBE_CODE="$code"
+  PROBE_REASON=""
+
+  # Panels answer dead channels with a placeholder clip instead of an error,
+  # so a player shows it happily and the channel looks alive. The redirect
+  # target is what gives it away.
+  case "$redir" in
+  *offline* | *no_signal* | *nosignal* | *not_available* | *comingsoon*)
+    PROBE_REASON="placeholder"
+    [[ -n $quiet ]] && return 1
+    echo "${Y}⚠ stream $id is a placeholder, not live${N}"
+    echo "  the panel sends you to ${redir##*/} — the channel is listed but off air"
+    return 1
+    ;;
+  esac
+
+  case "$code" in
+  2* | 3* | "") return 0 ;;
+  000)
+    PROBE_REASON="no response"
+    [[ -n $quiet ]] && return 1
+    echo "${R}✗ no response from $XTREAM_HOST for stream $id${N}"
+    return 1
+    ;;
+  esac
+
+  PROBE_REASON="HTTP $code"
+  [[ -n $quiet ]] && return 1
+  echo "${R}✗ stream $id refused by the server (HTTP $code)${N}"
+  # Panels front themselves with proxies that invent status codes. These are
+  # the ones seen in the wild; 456 and 458 in particular are decided per
+  # account, before the channel is even looked up.
+  case "$code" in
+  456 | 458) echo "  $code — the panel refuses this account for playback (blocked line, or a geo/IP restriction). Same code for every channel, including ids that don't exist" >&2 ;;
+  401) echo "  401 — the line authenticates against the API but is not allowed to play. Usually a reseller line sold for listing only, or one bound to another IP/device. Same code for every channel" >&2 ;;
+  403) echo "  403 — rejected for playback, though the API accepted the line. Also what these panels answer while an earlier connection of yours is still counted" >&2 ;;
+  404) echo "  404 — no such stream id" >&2 ;;
+  451) echo "  451 — blocked for legal or geographic reasons at the panel's CDN" >&2 ;;
+  509 | 512) echo "  connection limit reached — check 'connections' in xtream status" >&2 ;;
+  513) echo "  513 — the panel does not recognise these credentials" >&2 ;;
+  884) echo "  884 — playlist/stream download blocked by the panel's CDN proxy" >&2 ;;
+  esac
+  return 1
+}
+
+# playable [QUERY] — does this line actually stream anything? Takes the first
+# channel it lists (honouring -C / QUERY, so you can ask about the channels
+# you care about) and asks the panel for it. A line can sit there Active with
+# 20,000 channels and refuse every one of them.
+cmd_playable() {
+  local q="${1:-}" list names row id name url matches purl sample
+  local must_ok=0 must_total=0 missing="" tok
+  local info st exp cons tz alias
+
+  # One small request first. It says whether the line is alive, when it dies,
+  # how many connections it allows and where the server thinks it lives — all
+  # the cheap reasons to drop a line before pulling megabytes of catalogue.
+  if [[ -z ${STALKER:-} ]]; then
+    info="$(api 2>/dev/null || true)"
+    if [[ -n $info ]]; then
+      st="$(jq -r '.user_info.status // ""' <<<"$info" 2>/dev/null || true)"
+      exp="$(jq -r 'if (.user_info.exp_date // "") == "" then "never"
+                    else (.user_info.exp_date | tonumber | localtime | strftime("%Y-%m-%d")) end' <<<"$info" 2>/dev/null || true)"
+      cons="$(jq -r '"\(.user_info.active_cons // "-")/\(.user_info.max_connections // "-")"' <<<"$info" 2>/dev/null || true)"
+      tz="$(jq -r '.server_info.timezone // ""' <<<"$info" 2>/dev/null || true)"
+      # Panels report the address they call themselves, which is often a name
+      # where the dump has a bare IP — one less thing to spell out on a remote.
+      alias="$(jq -r '(.server_info.url // "") as $h | (.server_info.port // "" | tostring) as $p
+                      | if $h == "" then "" elif $p == "" then $h else $h + ":" + $p end' <<<"$info" 2>/dev/null || true)"
+    fi
+    [[ -n ${exp:-} ]] && echo "expires   $exp"
+    [[ -n ${cons:-} ]] && echo "conns     $cons"
+    [[ -n ${tz:-} ]] && echo "tz        $tz"
+
+    if [[ -n $TZQ ]]; then
+      if [[ -z ${tz:-} ]] || ! grep -qiE "$TZQ" <<<"$tz"; then
+        echo "playable  no"
+        echo "reason    tz ${tz:-unknown}"
+        return 1
+      fi
+    fi
+    if [[ -n ${st:-} && $st != Active ]]; then
+      echo "playable  no"
+      echo "reason    $st"
+      return 1
+    fi
+  fi
+
+  if [[ -n ${STALKER:-} ]]; then
+    list="$(stalker_run search "$q")" || exit 1
+  else
+    list="$(list_streams "$q")" || exit 1
+  fi
+
+  if [[ -z $list ]]; then
+    echo "playable  no"
+    echo "reason    no matching channel"
+    return 1
+  fi
+
+  matches="$(grep -c . <<<"$list" || true)"
+  # name and category together: "TNT" may be the name (TNT CHILE PREMIUM HD)
+  # or the category (FUTBOL CHILE / TNT SPORTS).
+  names="$(cut -f2- <<<"$list")"
+
+  # -m: the channels that make a line worth having. Checked before anything
+  # is streamed — a line without them is not worth the probe.
+  if [[ -n $MUST ]]; then
+    while IFS= read -r tok; do
+      [[ -n $tok ]] || continue
+      must_total=$((must_total + 1))
+      if grep -qiE "$tok" <<<"$names"; then
+        must_ok=$((must_ok + 1))
+      else
+        missing="${missing:+$missing, }$tok"
+      fi
+    done < <(printf '%s\n' "$MUST" | tr ',' '\n')
+  fi
+
+  echo "matches   $matches"
+  ((must_total == 0)) || echo "must      $must_ok/$must_total"
+  # What it carries, by category and size. Eight channel names off the top of
+  # the list say nothing — 1267 matches split as "GEO CHILE (REGIONAL) 1062 ·
+  # FUTBOL CHILE 34" tells you at a glance whether the sport is in there.
+  sample="$(cut -f3 <<<"$list" | sort | uniq -c | sort -rn | head -6 |
+    awk '{ n = $1; $1 = ""; gsub(/[^[:print:]]/, ""); gsub(/  +/, " ");
+           sub(/^ +/, ""); sub(/ +$/, "");
+           printf "%s%s %s", sep, substr($0, 1, 34), n; sep = " · " }')"
+  echo "sample    $sample"
+
+  if ((must_total > 0)) && ((must_ok < must_total)); then
+    echo "playable  no"
+    echo "reason    missing $missing"
+    return 1
+  fi
+
+  row="$(head -1 <<<"$list")"
+  id="$(cut -f1 <<<"$row")"
+  name="$(cut -f2 <<<"$row")"
+
+  if [[ -n ${STALKER:-} ]]; then
+    url="$(stalker_run url "$id")" || exit 1
+    purl="stalker:${STALKER_PORTAL}#${STALKER_MAC}"
+  else
+    url="$(stream_url "$id")" || exit 1
+    purl="${URL_OVERRIDE:-$XTREAM_HOST/get.php?username=$XTREAM_USER&password=$XTREAM_PASS&type=m3u_plus}"
+  fi
+
+  if http_probe_stream "$url" "$id" quiet; then
+    echo "playable  yes"
+    echo "channel   $id  $name"
+    echo "url       $purl"
+    # A TV asks for server/username/password separately, which is a lot less
+    # typing on a remote than the whole URL — and these are decoded, so a
+    # password written %40 in the dump is the @ you actually have to type.
+    if [[ -z ${STALKER:-} ]]; then
+      echo "server    $XTREAM_HOST"
+      echo "user      $XTREAM_USER"
+      echo "pass      $XTREAM_PASS"
+      [[ -n ${alias:-} && ${XTREAM_HOST#*://} != "$alias" ]] && echo "alias     $alias"
+    fi
+    return 0
+  fi
+  echo "playable  no"
+  echo "channel   $id  $name"
+  echo "reason    ${PROBE_REASON:-refused}"
+  return 1
 }
 
 cmd_check() {
   need ffprobe
   [[ -n ${1:-} ]] || die "usage: xtream check <ID|QUERY>"
 
-  local id url info errlog rc=0 tracks code
+  local id url info errlog rc=0 tracks
   if [[ -n ${STALKER:-} ]]; then
     id="$1"
     url="$(stalker_run url "$1")" || exit 1
@@ -1126,45 +1927,7 @@ cmd_check() {
     url="$(stream_url "$id")" || exit 1
   fi
 
-  # Ask the server first: ffprobe reports refusals as "4XX Client Error, but
-  # not one of 40{0,1,3,4}", which tells you nothing. Panels lean on
-  # non-standard codes, so surface the number and what it usually means.
-  local probe redir
-  probe="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' \
-    --connect-timeout "$CONNECT_TIMEOUT" --max-time 10 -r 0-1024 "$url" 2>/dev/null || true)"
-  code="${probe%% *}"
-  redir="${probe#* }"
-
-  # Panels answer dead channels with a placeholder clip instead of an error,
-  # so ffprobe decodes it happily and the channel looks alive. The redirect
-  # target is what gives it away.
-  case "$redir" in
-  *offline* | *no_signal* | *nosignal* | *not_available* | *comingsoon*)
-    echo "${Y}⚠ stream $id is a placeholder, not live${N}"
-    echo "  the panel redirects to ${redir##*/} — the channel is listed but off air"
-    exit 1
-    ;;
-  esac
-
-  case "$code" in
-  2* | 3* | "") ;; # let ffprobe have the final say
-  000) die "no response from $XTREAM_HOST for stream $id" ;;
-  *)
-    echo "${R}✗ stream $id refused by the server (HTTP $code)${N}"
-    # Panels front themselves with proxies that invent status codes. These are
-    # the ones seen in the wild; 456 in particular is decided per-account,
-    # before the channel is even looked up.
-    case "$code" in
-    456) echo "  456 — the panel refuses this account for playback (blocked line, or a geo/IP restriction). Same code for every channel, including ids that don't exist" >&2 ;;
-    403) echo "  403 — credentials rejected for playback, though the API accepted them" >&2 ;;
-    404) echo "  404 — no such stream id" >&2 ;;
-    509 | 512) echo "  connection limit reached — check 'connections' in xtream status" >&2 ;;
-    513) echo "  513 — the panel does not recognise these credentials" >&2 ;;
-    884) echo "  884 — playlist/stream download blocked by the panel's CDN proxy" >&2 ;;
-    esac
-    exit 1
-    ;;
-  esac
+  http_probe_stream "$url" "$id" || exit 1
 
   # Keep stderr out of the JSON: decoders happily log warnings at error level
   # ("non-existing SPS 0 referenced...") on perfectly playable streams.
@@ -1176,6 +1939,19 @@ cmd_check() {
     -timeout "$((PROBE_TIMEOUT * 1000000))" "$url" 2>"$errlog")" || rc=$?
 
   tracks="$(jq -r '.streams | length' <<<"${info:-}" 2>/dev/null || echo 0)"
+
+  # The probe above opened a connection, and panels keep counting it for a few
+  # seconds after it closes — on a line capped at 1 or 2 that alone is enough
+  # to make the very next request fail. One retry, once the slot has cleared,
+  # before calling a stream dead.
+  if ((rc != 0)) || [[ ${tracks:-0} -eq 0 ]]; then
+    [[ -n $ISATTY ]] && echo "${D}retrying — the panel may still be counting the probe connection${N}" >&2
+    sleep 4
+    rc=0
+    info="$(ffprobe -v error -print_format json -show_streams \
+      -timeout "$((PROBE_TIMEOUT * 1000000))" "$url" 2>"$errlog")" || rc=$?
+    tracks="$(jq -r '.streams | length' <<<"${info:-}" 2>/dev/null || echo 0)"
+  fi
 
   if ((rc != 0)) || [[ ${tracks:-0} -eq 0 ]]; then
     echo "${R}✗ stream $id is not playing${N}"
@@ -1269,11 +2045,47 @@ EOF
   [[ $name == default ]] || echo "  use it with: xtream -p $name status"
 }
 
+# Run one command against the line that is already loaded. Shared by main and
+# by the single-line shortcut in cmd_batch, so `dump.txt -n 3384 play 756470`
+# is the same code path as a bare `xtream <url> play 756470` — picker and
+# player included, which a batch worker could never have.
+run_command() {
+  local cmd="$1"
+  [[ $# -gt 0 ]] && shift
+
+  case "$cmd" in
+  status) cmd_status ;;
+  quick) cmd_quick ;;
+  batch) cmd_batch "$@" ;;
+  save) cmd_save "${1:-default}" ;;
+  search) cmd_search "${1:-}" ;;
+  categories | cats) cmd_categories ;;
+  url) cmd_url "${1:-}" ;;
+  play) cmd_play "${1:-}" ;;
+  check) cmd_check "${1:-}" ;;
+  playable) cmd_playable "${1:-}" ;;
+  counts) cmd_counts "$@" ;;
+  raw) cmd_raw "${1:-}" ;;
+  help) usage ;;
+  *) die "unknown command '$cmd' (try --help)" ;;
+  esac
+}
+
 # -------------------------------------------------------------------- main ---
 
 main() {
-  while [[ ${1:-} == -* ]]; do
+  # Options are read from anywhere on the line, not just the front: the natural
+  # way to type these is source first, flags after — `xtream dump.txt -n 3384
+  # search chile`. Everything that isn't a flag or a flag's value is collected
+  # and replayed as the command.
+  local -a rest=()
+  while (($#)); do
     case "$1" in
+    --)
+      shift
+      while (($#)); do rest+=("$1"); shift; done
+      break
+      ;;
     -p | --profile)
       PROFILE="${2:?--profile needs a name}"
       shift 2
@@ -1289,6 +2101,45 @@ main() {
     -c | --connect-timeout)
       CONNECT_TIMEOUT="${2:?--connect-timeout needs seconds}"
       shift 2
+      ;;
+    -T | --timeout)
+      TIMEOUT="${2:?--timeout needs seconds}"
+      BATCH_TIMEOUT="$2"
+      shift 2
+      ;;
+    -j | --jobs)
+      BATCH_CONCURRENCY="${2:?--jobs needs a number}"
+      JOBS_SET=1
+      shift 2
+      ;;
+    -n | --only)
+      ONLY="${2:?--only needs a line number, range or list}"
+      shift 2
+      ;;
+    -C | --category)
+      CATQ="${2:?--category needs a regex}"
+      shift 2
+      ;;
+    -m | --must)
+      MUST="${2:?--must needs a channel name (or a comma-separated list)}"
+      shift 2
+      ;;
+    -z | --timezone)
+      TZQ="${2:?--timezone needs a regex, e.g. santiago}"
+      shift 2
+      ;;
+    -a | --all)
+      SHOW_ALL=1
+      shift
+      ;;
+    -o | --out)
+      if out_takes_value "${2:-}"; then
+        setup_out "$2"
+        shift 2
+      else
+        setup_out ""
+        shift
+      fi
       ;;
     -r | --refresh)
       REFRESH=1
@@ -1306,9 +2157,11 @@ main() {
       usage
       exit 0
       ;;
-    *) die "unknown option '$1' (try --help)" ;;
+    -*) die "unknown option '$1' (try --help)" ;;
+    *) rest+=("$1"); shift ;;
     esac
   done
+  set -- ${rest[@]+"${rest[@]}"}
 
   case "$KIND" in
   live | vod | series) ;;
@@ -1330,6 +2183,14 @@ main() {
     return
   fi
 
+  # A local file of dumped lines expands the same way — hand it straight to
+  # batch. Checked before the URL fast paths so a path is never mistaken for a
+  # command.
+  if [[ -n ${1:-} && -f ${1} ]]; then
+    cmd_batch "$@"
+    return
+  fi
+
   # A bare URL as the first argument is the fast path: paste what the provider
   # sent you and get a verdict, no profile setup.
   local default_cmd="status"
@@ -1346,22 +2207,7 @@ main() {
   [[ $# -gt 0 ]] && shift
 
   load_config
-
-  case "$cmd" in
-  status) cmd_status ;;
-  quick) cmd_quick ;;
-  batch) cmd_batch "$@" ;;
-  save) cmd_save "${1:-default}" ;;
-  search) cmd_search "${1:-}" ;;
-  categories | cats) cmd_categories ;;
-  url) cmd_url "${1:-}" ;;
-  play) cmd_play "${1:-}" ;;
-  check) cmd_check "${1:-}" ;;
-  counts) cmd_counts ;;
-  raw) cmd_raw "${1:-}" ;;
-  help) usage ;;
-  *) die "unknown command '$cmd' (try --help)" ;;
-  esac
+  run_command "$cmd" "$@"
 }
 
 main "$@"

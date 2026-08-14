@@ -1,16 +1,39 @@
 # xtream
 
-A small terminal tool for checking IPTV lines and searching their channels. It answers two questions fast:
+A small terminal tool for working through IPTV lines: which ones are alive, which
+carry the channels you want, and which actually stream them.
 
-- **Is this line active?** — status, expiry, connection limits
-- **Does it carry the channel I want, and does it actually play?** — search by name, then probe the stream with `ffprobe`
+The job it was built for: you have a text file with a few thousand lines shared
+by someone, you want the handful worth typing into a TV, and typing anything
+into a TV with a remote is slow enough that you only want to do it once.
+
+```bash
+xtream lines.txt -z santiago -m tnt playable chile -o good.txt
+```
+
+Read as: of every line in the file, keep the ones on a Chilean server, carrying
+channels matching "chile", with TNT among them, that will actually stream one.
+What comes back is ranked, best first:
+
+```
+  1. line 53 · someuser  1270 ch  must 1/1  exp 2026-10-11  conn 1/3  America/Santiago
+     GEO CHILE (REGIONAL) 1062 · ZAPPING CHILE 98 · FUTBÓL CHILE 34
+     http://panel.example.com:8080/get.php?username=someuser&password=…
+     tv: panel.example.com:8080  ·  someuser  ·  somepassword
+```
+
+The middle line is what it carries, by category and size, because 1270 channels
+are worth nothing if none of them is the football. The last line is the three
+fields a TV asks for, URL-decoded and without the `http://` that every app
+assumes and nobody enjoys typing on a remote.
 
 It speaks two protocols:
 
 - **Xtream Codes** — the usual `get.php` / `player_api.php` API (username + password)
 - **Stalker / Ministra portals** — MAC-based, no username/password
 
-…and it can expand a whole **batch** of lines shared as a single base64 code, running any command against every line in parallel.
+…and it reads a whole **batch** of lines from a local file or a base64 paste
+code, running any command against every line in parallel.
 
 > **Where the codes come from.** The base64 paste codes this tool decodes are the ones shared on the subreddit **[r/IPTV_ZONENEW](https://www.reddit.com/r/IPTV_ZONENEW/)** — each post's "Xtream" text is a base64-encoded [paste.sh](https://paste.sh) link holding a stack of lines. Copy that text and hand it straight to `xtream`.
 
@@ -34,7 +57,7 @@ It's a single Bash script (Bash 3.2+, so stock macOS is fine) using standard Uni
 | `python3`, `openssl` | decoding base64 / paste.sh dumps and Stalker portals |
 | `ffmpeg` (`ffprobe`) | `check` — verifying a stream really plays |
 | `mpv` | `play` — opening a channel |
-| `fzf` | the interactive picker in `play` |
+| `fzf` | the picker in `play`, only when a query matches several channels |
 | `op` (1Password CLI) | optional, only if you store credentials as `op://` refs |
 
 Install the core tools with your package manager, e.g.:
@@ -63,35 +86,58 @@ Make sure `~/.local/bin` is on your `PATH`. That's it — no build step.
 
 ## Quick start
 
-### Test a line someone sent you
+### Work through a file of many lines
 
-Paste a provider's URL directly — no setup. With no command it prints a quick verdict (status + categories + channel count):
+Point it at a text file of `get.php` URLs (or a base64 code from a post). Every
+line gets a number, and that number addresses it for the rest of the session:
+
+```bash
+xtream lines.txt lines                          # the index: which URL is line 53
+xtream lines.txt -z santiago playable chile     # the sweep
+xtream lines.txt -n 53 search chile             # what line 53 carries
+xtream lines.txt -n 53 check 98                 # does that channel really play
+xtream lines.txt -n 53 play 98                  # watch it before committing
+```
+
+The sweep has three filters, cheapest first:
+
+| Flag | What it does |
+|------|--------------|
+| `-z RX` | keep lines whose server reports a matching timezone (`santiago`). It comes from a tiny request, so lines that fail it never download a catalogue — this is what makes thousands of lines quick. Expired lines drop out here too. |
+| `QUERY` | matches a channel's name **or** its category, because panels split evenly between "TNT CHILE PREMIUM HD" filed under DEPORTES and "TNT SPORTS 1" filed under FUTBÓL CHILE. `-C RX` restricts to the category alone. |
+| `-m LIST` | channels the line has to carry, comma-separated regexes, matched inside what QUERY already selected. That scoping is what disambiguates the half-dozen `TNT SPORTS <country>` feeds. |
+
+Everything else is counted and left out: wrong timezone, expired, no matching
+channels, missing a must-have, lists them but refuses to stream, host long dead.
+`-a` keeps every line and says which of those it was. Results print as they land
+and again ranked at the end, so a long run can be interrupted without losing
+what it found. `-o FILE` mirrors the run into a file, and `-n @FILE` reads the
+line numbers back out of one.
+
+### Test a single line someone sent you
+
+Paste a provider's URL directly — no setup. With no command it prints a quick
+verdict (status + categories + channel count):
 
 ```bash
 xtream 'http://host:8080/get.php?username=USER&password=PASS&type=m3u_plus'
-```
-
-Then search and probe:
-
-```bash
 xtream 'http://host:8080/get.php?username=USER&password=PASS' search 'espn'
 xtream 'http://host:8080/get.php?username=USER&password=PASS' check 'espn hd'
 ```
 
 > Quote the URL — an unquoted `&` backgrounds the command.
 
-### Test a whole batch (a base64 code from r/IPTV_ZONENEW)
-
-Copy the "Xtream" text from a post and hand it in. It decodes, decrypts the paste, finds every line, and runs your command on each — in parallel:
+### Rank a batch without caring what it carries
 
 ```bash
-xtream '<base64-code>'                 # one-line status of every line
-xtream '<base64-code>' search 'cnn'    # search each active line
-xtream '<base64-code>' counts          # channel counts per line
-xtream '<base64-code>' --stats         # status + live/movie counts
+xtream lines.txt                       # one-line status of every line
+xtream lines.txt --stats status        # …plus live/movie counts per line
+xtream lines.txt counts                # channel counts per line
 ```
 
-Lines on a shared server hand out the same channel list, so identical results are folded to `(same as <first line>)` — which conveniently also flags any line whose package differs.
+Lines on a shared server hand out the same channel list, so identical results
+are folded together — which conveniently also flags any line whose package
+differs.
 
 ### Paste formats it understands
 
@@ -116,15 +162,27 @@ xtream 'stalker:http://portal.example:80/c/#00:1A:79:XX:XX:XX' check 'bein sport
 
 | Command | What it does |
 |---------|--------------|
+| `playable [QUERY]` | does this line carry these channels **and** stream them? filters on `-z` / QUERY / `-m`, ranks what survives, prints the URL and the TV login fields |
+| `lines` | the numbered index of a dump: number, user, URL |
 | `status` | active/expired, expiry date, connections in use |
-| `search [QUERY]` | channel names matching a case-insensitive regex |
+| `search [QUERY]` | channels whose name or category matches a case-insensitive regex |
 | `check <ID\|QUERY>` | probe the stream with ffprobe — does it really play? |
 | `url <ID\|QUERY>` | print the direct stream URL |
-| `play [QUERY]` | pick a channel (fzf) and open it in mpv |
-| `counts` | how many live channels / movies / series |
+| `play <ID\|QUERY>` | open it in mpv; an id or a single match starts straight away |
+| `counts [WHAT…]` | how many live channels / movies / series |
 | `categories` | list categories |
 | `save [NAME]` | save the current line as a profile |
-| `batch <code> [cmd]` | expand a base64/paste.sh dump and run cmd on each line |
+| `quick` | status + categories + live count |
+
+With a single line selected (`-n N`), every command behaves exactly as if you
+had handed xtream that line's URL — picker, player and all.
+
+Useful options: `-n` line numbers (`53`, `10-20`, `1,5,900`, `@file`), `-C`
+category, `-m` must-have channels, `-z` timezone, `-a` show the failures too,
+`-o` mirror the run to a file, `-j` how many lines at once (chosen from the size
+of the dump unless you set it), `-T` per-line timeout, `-r` bypass the cache.
+
+Every run prints how long it took.
 
 Run `xtream --help` for the full list and options.
 
