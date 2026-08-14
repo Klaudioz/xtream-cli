@@ -3,9 +3,10 @@
 A small terminal tool for working through IPTV lines: which ones are alive, which
 carry the channels you want, and which actually stream them.
 
-The job it was built for: you have a text file with a few thousand lines shared
-by someone, you want the handful worth typing into a TV, and typing anything
-into a TV with a remote is slow enough that you only want to do it once.
+The job it was built for: you have a few thousand lines from a dump on
+[r/IPTV_ZONENEW](https://www.reddit.com/r/IPTV_ZONENEW/), you want the handful
+worth typing into a TV, and typing anything into a TV with a remote is slow
+enough that you only want to do it once.
 
 ```bash
 xtream lines.txt -z santiago -m tnt playable chile -o good.txt
@@ -206,7 +207,7 @@ Channel lists are cached under `~/.cache/xtream/` for 6 hours (`-r` bypasses the
 
 - **No credentials live in this repository.** The script reads them at runtime from the URL you pass or from your local `~/.config/xtream/` files, which are never committed.
 - Profile files are written with `600` permissions, and secrets can be kept in 1Password instead of on disk.
-- The base64 codes shared on r/IPTV_ZONENEW contain **other people's line credentials**, posted publicly by third parties. This tool only reads them; what you do with them is your responsibility. Use it to check lines you're authorized to use.
+- The base64 codes shared on [r/IPTV_ZONENEW](https://www.reddit.com/r/IPTV_ZONENEW/) contain **other people's line credentials**, posted publicly by third parties. This tool only reads them; what you do with them is your responsibility. Use it to check lines you're authorized to use.
 
 ## License
 
