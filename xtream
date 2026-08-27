@@ -695,6 +695,28 @@ extract_xtream_urls() {
       next
     }
 
+    # (2b) host and credentials on the same row, as tab-separated tables put
+    # them: "http://host:80 <TAB> user : pass <TAB> UTC <TAB> Active …". The
+    # pair is looked for after the URL, which keeps the colon in a :8080 port
+    # out of the way, and MAC lines are left to the Stalker rule above.
+    line !~ /(get\.php|player_api\.php)/ &&
+    line !~ /([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}/ &&
+    match(line, /https?:\/\/[^][()[:space:]]+/) {
+      h = substr(line, RSTART, RLENGTH); sub(/\/+$/, "", h)
+      rest = substr(line, RSTART + RLENGTH)
+      if (match(rest, /[A-Za-z0-9._@+-]{2,}[ \t]*:[ \t]*[A-Za-z0-9._@+-]{2,}/)) {
+        pair = substr(rest, RSTART, RLENGTH)
+        n2 = split(pair, kv, /[ \t]*:[ \t]*/)
+        u = kv[1]; p = kv[2]
+        lu = tolower(u); lp = tolower(p)
+        if (n2 == 2 && !(lu ~ /^(usr|user|username|login|line)$/ || lp ~ /^(pw|pass|password)$/)) {
+          emit(h "/get.php?username=" u "&password=" p "&type=m3u_plus")
+          host = h
+          next
+        }
+      }
+    }
+
     # Any scheme-qualified host URL sets the context for the rows/pairs beneath
     # it. Handles a bare line, a markdown-wrapped [http://h](http://h), or a
     # "Host: http://h" prefix. get.php URLs are excluded, so an "M3U:" line
