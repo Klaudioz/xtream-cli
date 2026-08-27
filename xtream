@@ -45,6 +45,12 @@ PROBE_REASON=""   # … and a short reason ("HTTP 458", "placeholder")
 CATQ=""           # --category: restrict search/url to matching categories
 MUST=""           # --must: channels a line has to carry to be of any use
 TZQ=""            # --timezone: skip lines whose server sits somewhere else
+EPG_REQ=""        # --epg: skip lines whose panel serves no programme guide
+EPG_TIMEOUT="${XTREAM_EPG_TIMEOUT:-25}"
+EPG_CAP="${XTREAM_EPG_CAP:-262144}" # bytes of guide read before counting
+EPG_CHANNELS=0    # set by epg_probe …
+EPG_PROGRAMMES=0  # …
+EPG_TRUNCATED=""  # … and set when the cap cut the read short
 SHOW_ALL=""       # --all: keep the dead/refused rows in a batch listing
 SKIP_SEEN=""      # --skip: seconds within which a known-dead line is left alone
 SKIP_SPEC=""      # … as it was typed ("7d"), which is what to say back
@@ -178,6 +184,11 @@ THE USUAL JOB — A FILE FULL OF LINES
               It comes from a tiny request, so lines that fail it never
               download a catalogue — this is what makes a sweep over
               thousands of lines quick. Expired lines are dropped here too.
+      -E      keep only lines whose panel serves a real programme guide.
+              Most answer /xmltv.php with channel names and nothing else,
+              which is a guide a TV cannot show; this counts <programme> in
+              the first 256KB. `xtream <line> epg` asks about one line and
+              counts the whole thing.
       QUERY   matches a channel's name OR its category, because panels split
               evenly between "SKY SPORTS UK MAIN EVENT" filed under SPORTS
               and "SKY SPORTS MAIN EVENT" filed under UK SPORTS. -C RX
@@ -319,6 +330,9 @@ COMMANDS
   play <ID|QUERY>     Play it in mpv. An id or a query that matches one
                       channel starts straight away; a wider query opens an
                       fzf picker.
+  epg                 Does this line come with a programme guide? Counts what
+                      {host}/xmltv.php actually returns — plenty of panels
+                      answer with channel names and no programmes at all
   playable [QUERY]    Does this line carry these channels AND play them?
                       Filters on -z / QUERY / -m, streams one of what is
                       left, and lists what survived best first, with the URL
@@ -345,6 +359,9 @@ OPTIONS
   -z, --timezone RX   playable: keep lines whose server reports a matching
                       timezone (e.g. london). Checked before any catalogue
                       is downloaded, so it is what makes a big sweep quick
+  -E, --epg           playable: keep only lines whose panel serves a guide
+                      with programmes in it. Reads the first 256KB, which is
+                      still cheaper than the catalogue, so it runs first
   -n, --only SPEC     Batch: only these line numbers (12, 10-20, 1,5,900-905),
                       or @FILE to take them from a run you already have
   -a, --all           Batch: list the dead and refused lines too, not just
@@ -1000,7 +1017,7 @@ render_playable_row() {
 render_playable_detail() {
   local rank="$1" pos="$2"
   local u="${urls[$((pos - 1))]}" n="${idx[$((pos - 1))]}"
-  local out matches must sample exp cons tz user lead srv usr pw alias
+  local out matches must sample exp cons tz epg user lead srv usr pw alias
   user="$(batch_label "$u")"
   out="$(cat "$tmp/$pos.done" 2>/dev/null || true)"
   matches="$(sed -n 's/^matches *//p' <<<"$out")"
@@ -1009,6 +1026,7 @@ render_playable_detail() {
   exp="$(sed -n 's/^expires *//p' <<<"$out")"
   cons="$(sed -n 's/^conns *//p' <<<"$out")"
   tz="$(sed -n 's/^tz *//p' <<<"$out")"
+  epg="$(sed -n 's/^epg *//p' <<<"$out")"
   srv="$(sed -n 's/^server *//p' <<<"$out")"
   alias="$(sed -n 's/^alias *//p' <<<"$out")"
   usr="$(sed -n 's/^user *//p' <<<"$out")"
@@ -1018,10 +1036,10 @@ render_playable_detail() {
   # found just says which line it is.
   if [[ -n $rank ]]; then lead="$(printf '%3d. ' "$rank")"; else lead="     "; fi
 
-  printf '%s%bline %d · %s%b  %s ch%s%s%s%s\n' \
+  printf '%s%bline %d · %s%b  %s ch%s%s%s%s%s\n' \
     "$lead" "$B" "$n" "$user" "$N" "${matches:-?}" \
-    "${must:+  must $must}" "${exp:+  exp $exp}" "${cons:+  conn $cons}" \
-    "${tz:+  $tz}"
+    "${must:+  must $must}" "${epg:+  epg $epg}" "${exp:+  exp $exp}" \
+    "${cons:+  conn $cons}" "${tz:+  $tz}"
   printf '     %s%s%s\n' "$D" "$sample" "$N"
   printf '     %s\n' "$u"
   # Typing this into a TV is the last step, and the three fields are what it
@@ -1176,6 +1194,7 @@ cmd_batch() {
     -C | --category) CATQ="${2:?--category needs a regex}"; shift 2 ;;
     -m | --must) MUST="${2:?--must needs a channel name (or a comma-separated list)}"; shift 2 ;;
     -z | --timezone) TZQ="${2:?--timezone needs a regex, e.g. london}"; shift 2 ;;
+    -E | --epg) EPG_REQ=1; shift ;;
     -a | --all) SHOW_ALL=1; shift ;;
     -s | --skip)
       SKIP_SEEN="$(parse_duration "${2:?--skip needs a duration, e.g. 7d}")"
@@ -1326,6 +1345,7 @@ cmd_batch() {
   [[ -n $CATQ ]] && fwd+=(-C "$CATQ")
   [[ -n $MUST ]] && fwd+=(-m "$MUST")
   [[ -n $TZQ ]] && fwd+=(-z "$TZQ")
+  [[ -n $EPG_REQ ]] && fwd+=(-E)
   [[ $KIND != live ]] && fwd+=(-t "$KIND")
   [[ -n $REFRESH ]] && fwd+=(-r)
 
@@ -2037,6 +2057,60 @@ http_probe_stream() {
 # channel it lists (honouring -C / QUERY, so you can ask about the channels
 # you care about) and asks the panel for it. A line can sit there Active with
 # 20,000 channels and refuse every one of them.
+# The panel's own XMLTV guide lives at {host}/xmltv.php. Plenty of panels
+# answer with channel definitions and not one programme, which is a guide in
+# name only — counting <programme> is the only way to tell.
+#
+# Only the first EPG_CAP bytes are read: a populated guide runs to tens of
+# megabytes, and "are there programmes in here" is answered by the first
+# screenful. Sets EPG_CHANNELS / EPG_PROGRAMMES / EPG_TRUNCATED.
+epg_probe() {
+  local cap="${1:-$EPG_CAP}" f magic
+  EPG_CHANNELS=0
+  EPG_PROGRAMMES=0
+  EPG_TRUNCATED=""
+  [[ -z ${STALKER:-} ]] || return 1
+
+  f="$(mktemp "${TMPDIR:-/tmp}/xtream-epg.XXXXXX")"
+  curl -fsS --compressed \
+    --connect-timeout "$CONNECT_TIMEOUT" --max-time "$EPG_TIMEOUT" \
+    --get --data-urlencode "username=$XTREAM_USER" --data-urlencode "password=$XTREAM_PASS" \
+    "$XTREAM_HOST/xmltv.php" 2>/dev/null | head -c "$cap" >"$f" || true
+
+  if [[ ! -s $f ]]; then
+    rm -f "$f"
+    return 1
+  fi
+  # Some panels hand over a gzipped body rather than gzip transfer-encoding.
+  magic="$(head -c 2 "$f" | od -An -tx1 | tr -d ' \n')"
+  if [[ $magic == 1f8b ]]; then
+    gzip -dc <"$f" >"$f.x" 2>/dev/null && mv -f "$f.x" "$f" || rm -f "$f.x"
+  fi
+
+  [[ $(wc -c <"$f") -ge $cap ]] && EPG_TRUNCATED=1
+  EPG_CHANNELS="$(grep -o '<channel ' "$f" | wc -l | tr -d ' ')"
+  EPG_PROGRAMMES="$(grep -o '<programme' "$f" | wc -l | tr -d ' ')"
+  rm -f "$f"
+  ((EPG_PROGRAMMES > 0))
+}
+
+# epg — does this line come with a usable guide, and what to point a player at.
+cmd_epg() {
+  if [[ -n ${STALKER:-} ]]; then
+    die "stalker portals carry their own guide; xmltv.php is an Xtream endpoint"
+  fi
+  # No cap here: this is one line, asked about on purpose, so count it all.
+  epg_probe 1073741824 || true
+  printf '%-13s%s\n' channels "$EPG_CHANNELS"
+  printf '%-13s%s\n' programmes "$EPG_PROGRAMMES"
+  printf '%-13s%s\n' url "$XTREAM_HOST/xmltv.php?username=$XTREAM_USER&password=$XTREAM_PASS"
+  if ((EPG_PROGRAMMES > 0)); then
+    echo "${G}✓ this line carries a guide${N}"
+  else
+    echo "${Y}! channel names only, no programmes — nothing for a TV guide to show${N}"
+  fi
+}
+
 cmd_playable() {
   local q="${1:-}" list names row id name url matches purl sample
   local must_ok=0 must_total=0 missing="" tok
@@ -2073,6 +2147,18 @@ cmd_playable() {
       echo "playable  no"
       echo "reason    $st"
       return 1
+    fi
+
+    # -E: a guide is wanted. Costs a capped read, which is far less than the
+    # catalogue below, so it belongs on this side of the download.
+    if [[ -n $EPG_REQ ]]; then
+      if epg_probe; then
+        echo "epg       ${EPG_PROGRAMMES}${EPG_TRUNCATED:++}"
+      else
+        echo "playable  no"
+        echo "reason    no epg"
+        return 1
+      fi
     fi
   fi
 
@@ -2307,6 +2393,7 @@ run_command() {
   play) cmd_play "${1:-}" ;;
   check) cmd_check "${1:-}" ;;
   playable) cmd_playable "${1:-}" ;;
+  epg) cmd_epg ;;
   counts) cmd_counts "$@" ;;
   raw) cmd_raw "${1:-}" ;;
   help) usage ;;
@@ -2370,6 +2457,10 @@ main() {
     -z | --timezone)
       TZQ="${2:?--timezone needs a regex, e.g. london}"
       shift 2
+      ;;
+    -E | --epg)
+      EPG_REQ=1
+      shift
       ;;
     -a | --all)
       SHOW_ALL=1

@@ -105,6 +105,7 @@ The sweep has three filters, cheapest first:
 | Flag | What it does |
 |------|--------------|
 | `-z RX` | keep lines whose server reports a matching timezone (`london`). It comes from a tiny request, so lines that fail it never download a catalogue — this is what makes thousands of lines quick. Expired lines drop out here too. |
+| `-E` | keep only lines whose panel serves a real programme guide. Most answer `/xmltv.php` with channel names and no programmes, which no TV can display; this counts `<programme>` in the first 256KB. |
 | `QUERY` | matches a channel's name **or** its category, because panels split evenly between "SKY SPORTS UK MAIN EVENT" filed under SPORTS and "SKY SPORTS MAIN EVENT" filed under UK SPORTS. `-C RX` restricts to the category alone. |
 | `-m LIST` | channels the line has to carry, comma-separated regexes, matched inside what QUERY already selected. That scoping is what tells the British Sky Sports apart from the Italian and German ones. |
 
@@ -188,7 +189,8 @@ xtream 'stalker:http://portal.example:80/c/#00:1A:79:XX:XX:XX' check 'bein sport
 
 | Command | What it does |
 |---------|--------------|
-| `playable [QUERY]` | does this line carry these channels **and** stream them? filters on `-z` / QUERY / `-m`, ranks what survives, prints the URL and the TV login fields |
+| `playable [QUERY]` | does this line carry these channels **and** stream them? filters on `-z` / `-E` / QUERY / `-m`, ranks what survives, prints the URL and the TV login fields |
+| `epg` | does this line come with a programme guide? counts what `/xmltv.php` really returns |
 | `lines` | the numbered index of a dump: number, user, URL |
 | `history` | what earlier runs made of each line, and when — no network |
 | `status` | active/expired, expiry date, connections in use |
