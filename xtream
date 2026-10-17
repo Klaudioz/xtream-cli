@@ -1643,7 +1643,10 @@ api() {
   printf '%s' "$resp"
 }
 
-mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
+# GNU first: GNU stat reads `-f %m` as "filesystem status of a file named %m",
+# printing a block to stdout before failing, which corrupts the fallback's
+# output. BSD stat rejects -c without writing to stdout.
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
 
 # Portable content hash for dedup: shasum on macOS, sha1sum on most Linux,
 # cksum as a last resort. Only stability matters, not the algorithm.
