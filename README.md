@@ -127,14 +127,16 @@ xtream lines.txt -s 7d -z london playable uk    # …and don't ask them again
 ```
 
 `history` reads back, per line, one of **good** (it worked), **expired** (the
-panel says so), **dead** (nothing answered) or **alive** (it answered but
-didn't match what was asked), with how long ago that was and when the line last
-worked. It touches the network not at all, so it is instant.
+panel says so), **blocked** (it logs in but the panel refuses to stream it — an
+HTTP 401 and the like, a listing-only or IP-bound line), **dead** (nothing
+answered) or **alive** (it answered but didn't match what was asked), with how
+long ago that was and when the line last worked. It touches the network not at
+all, so it is instant.
 
-`-s DUR` then leaves out the lines a run in the last `DUR` found dead or
-expired, which on a dump that has been round the block once is most of them —
+`-s DUR` then leaves out the lines a run in the last `DUR` found dead, expired
+or blocked, which on a dump that has been round the block once is most of them —
 a second pass over 120 dead lines goes from a minute of connect timeouts to
-nothing at all. Only those two verdicts are skipped: "didn't match" is an
+nothing at all. Only those three verdicts are skipped: "didn't match" is an
 answer about a query, not about the line, so a different query still asks. `-r`
 rechecks everything and `-a` lists what was left out.
 

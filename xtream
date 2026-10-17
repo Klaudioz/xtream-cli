@@ -286,7 +286,7 @@ WORKING THROUGH A BIG DUMP
     -j N       how many lines to work on at the same time. Scales with the
                dump on its own (16 → 48); pass it only to override
     -T N       give up on a line after N seconds (default 90)
-    -s DUR     skip lines a run in the last DUR found dead or expired
+    -s DUR     skip lines a run in the last DUR found dead, expired or blocked
     -o FILE    mirror the whole run into FILE as well as the terminal
     --stats    slower: every line also downloads its full movie catalogue
 
@@ -299,17 +299,18 @@ COMING BACK TO A DUMP YOU ALREADY SWEPT
 
     xtream lines.txt history            # what the last runs made of each line
 
-  …reads back per line: good (it worked), expired (the panel says so), dead
-  (nothing answered), alive (it answered but didn't match the query), with how
-  long ago that was and when it last worked. No network, so it is instant.
+  …reads back per line: good (it worked), expired (the panel says so), blocked
+  (it logs in but the panel won't let it stream — an HTTP 401 and the like),
+  dead (nothing answered), alive (it answered but didn't match the query), with
+  how long ago that was and when it last worked. No network, so it is instant.
 
     xtream lines.txt -s 7d -z london playable uk
 
-  …leaves out the lines a run in the last week found dead or expired, which on
-  a dump that has been round the block once is most of them. Only those two
-  verdicts are skipped: "didn't match" is an answer about a query, not about
-  the line, so a different query still asks. -r rechecks everything, and -a
-  lists what was skipped.
+  …leaves out the lines a run in the last week found dead, expired or blocked,
+  which on a dump that has been round the block once is most of them. Only
+  those three verdicts are skipped: "didn't match" is an answer about a query,
+  not about the line, so a different query still asks. -r rechecks everything,
+  and -a lists what was skipped.
 
   Stalker/Ministra portals (MAC-based, no username/password) are handled
   too — a paste with "Panel ➤ … / Mac ➤ …" blocks expands like any other,
@@ -367,8 +368,8 @@ OPTIONS
   -a, --all           Batch: list the dead and refused lines too, not just
                       the ones that worked
   -s, --skip DUR      Batch: don't recheck lines a run in the last DUR found
-                      dead or expired (7d, 12h, 30m; a bare number means
-                      days). See `history`; -r rechecks them anyway
+                      dead, expired or blocked (7d, 12h, 30m; a bare number
+                      means days). See `history`; -r rechecks them anyway
   -j, --jobs N        Batch: how many lines to work on at the same time.
                       Chosen from the size of the dump unless you set it.
   -o, --out [FILE]    Also write everything to FILE (colours stripped).
@@ -995,8 +996,17 @@ render_playable_row() {
     # or a timezone it doesn't sit in is an answer to this query, not a fact
     # about the line, and skipping on it next time would hide a line that the
     # next query wants.
+    #
+    # A playback refusal is different: 401/451/456/458/513 say the panel knows
+    # this line and won't let it stream — listing-only, IP-bound, or barred —
+    # which is a fact about the line, not the query. Remember it as blocked so
+    # -s skips it like a dead one. 403 and the connection-limit codes are left
+    # out on purpose: both are transient while an earlier connection is still
+    # counted (see http_probe_stream).
     case "$reason" in
     Expired* | Banned* | Disabled*) history_note "$u" expired "${reason%% *}" ;;
+    "HTTP 401" | "HTTP 451" | "HTTP 456" | "HTTP 458" | "HTTP 513")
+      history_note "$u" blocked "$reason" ;;
     *) history_note "$u" alive "${reason:-refused}" ;;
     esac
     [[ -n $SHOW_ALL ]] || return 0
@@ -1178,6 +1188,9 @@ history_read() {
 # Record what a line turned out to be. Verdicts are deliberately few:
 #   good     it answered and is usable (a sweep hit, or an active account)
 #   expired  the panel says Expired/Banned/Disabled
+#   blocked  it logs in but the panel refuses to stream it — a listing-only or
+#            IP-bound line (HTTP 401/451/456/458/513). Skipped like dead:
+#            that refusal is about the line, not the query.
 #   dead     nothing answered
 #   alive    it answered but didn't qualify — a wrong timezone, a missing
 #            channel. Never skipped, because that verdict depends on the query
@@ -1282,7 +1295,7 @@ cmd_batch() {
       hage="$AGE"
       case "$HIST_VERDICT" in
       good) hcol="$G"; hdetail="${HIST_EXP:--}"; [[ $hdetail == - ]] && hdetail="" || hdetail="exp $hdetail" ;;
-      dead | expired) hcol="$R"; hdetail="$HIST_NOTE" ;;
+      dead | expired | blocked) hcol="$R"; hdetail="$HIST_NOTE" ;;
       *) hcol="$Y"; hdetail="$HIST_NOTE" ;;
       esac
       [[ $hdetail == - ]] && hdetail=""
@@ -1329,7 +1342,7 @@ cmd_batch() {
       su="${urls[$((k - 1))]}"
       history_key "$su"
       if history_read "$HKEY" &&
-        [[ $HIST_VERDICT == dead || $HIST_VERDICT == expired ]] &&
+        [[ $HIST_VERDICT == dead || $HIST_VERDICT == expired || $HIST_VERDICT == blocked ]] &&
         ((HIST_NOW - HIST_TS < SKIP_SEEN)); then
         n_skipped=$((n_skipped + 1))
         # Held back rather than printed here, so the count comes first and a
@@ -1348,7 +1361,7 @@ cmd_batch() {
     urls=(${sk_urls[@]+"${sk_urls[@]}"})
     idx=(${sk_idx[@]+"${sk_idx[@]}"})
     ((n_skipped == 0)) ||
-      echo "${D}skipping ${n_skipped} line(s) a run in the last ${SKIP_SPEC} found dead or expired${N}"
+      echo "${D}skipping ${n_skipped} line(s) a run in the last ${SKIP_SPEC} found dead, expired or blocked${N}"
     [[ -z $sk_show ]] || printf '%s' "$sk_show"
     ((${#urls[@]})) || {
       echo "${D}── nothing left to check (-r rechecks them all)${N}"
