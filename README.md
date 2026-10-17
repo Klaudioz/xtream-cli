@@ -28,6 +28,18 @@ are worth nothing if none of them is the football you want. The last line is the
 fields a TV asks for, URL-decoded and without the `http://` that every app
 assumes and nobody enjoys typing on a remote.
 
+Or, when all you want is **one line where a given channel really plays** — found
+and stream-tested for you, in a single command, no files:
+
+```bash
+xtream 'https://paste.sh/XXXXXXXX#KEY' -j 4 smooth 'chile.*tnt|tnt.*chile'
+```
+
+It sweeps the whole dump, and for every line that carries the channel it pulls
+the stream for a minute to confirm it plays without stuttering — then hands back
+a line with its TV login, best first. (The regex matches the name either way
+round, since one panel writes "CHILE … TNT" and another "TNT … CHILE".)
+
 It speaks two protocols:
 
 - **Xtream Codes** — the usual `get.php` / `player_api.php` API (username + password)
@@ -96,8 +108,9 @@ line gets a number, and that number addresses it for the rest of the session:
 xtream lines.txt lines                          # the index: which URL is line 53
 xtream lines.txt -z london playable uk          # the sweep
 xtream lines.txt -n 53 search uk                # what line 53 carries
+xtream lines.txt smooth 'tnt sports'            # find a line it plays smoothly on
 xtream lines.txt -n 53 check 98                 # does that channel really play
-xtream lines.txt -n 53 play 98                  # watch it before committing
+xtream lines.txt -n 53 play 98                  # or watch it yourself
 ```
 
 The sweep has three filters, cheapest first:
@@ -198,6 +211,7 @@ xtream 'stalker:http://portal.example:80/c/#00:1A:79:XX:XX:XX' check 'bein sport
 | `status` | active/expired, expiry date, connections in use |
 | `search [QUERY]` | channels whose name or category matches a case-insensitive regex |
 | `check <ID\|QUERY>` | probe the stream with ffprobe — does it really play? |
+| `smooth <ID\|QUERY>` | pull the stream for a minute and judge whether it plays without stuttering (`XTREAM_SMOOTH_SECS`, default 60), so you don't have to watch it. Over a whole dump (no `-n`) it sweeps like `playable` but confirms each hit with the full test — `xtream <dump> smooth 'tnt sports'` finds a line where the channel really plays, in one command |
 | `url <ID\|QUERY>` | print the direct stream URL |
 | `play <ID\|QUERY>` | open it in mpv; an id or a single match starts straight away |
 | `counts [WHAT…]` | how many live channels / movies / series |

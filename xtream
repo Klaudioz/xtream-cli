@@ -34,6 +34,13 @@ BATCH_TIMEOUT="${XTREAM_BATCH_TIMEOUT:-90}"
 SPEED_LIMIT="${XTREAM_SPEED_LIMIT:-1024}" # bytes/sec …
 SPEED_TIME="${XTREAM_SPEED_TIME:-30}"     # … sustained for this long = dead
 PROBE_TIMEOUT="${XTREAM_PROBE_TIMEOUT:-20}"
+# `smooth`: how many seconds of the live stream to pull before judging it. A
+# minute is long enough to catch the stutter a snapshot probe can't.
+SMOOTH_SECS="${XTREAM_SMOOTH_SECS:-60}"
+# Set when a `playable` sweep should confirm each hit with the full smooth test
+# instead of the instant probe — which is what `smooth <dump>` becomes. Passed
+# to the per-line workers through the environment.
+SMOOTH_VERIFY="${XTREAM_SMOOTH_VERIFY:-}"
 
 PROFILE="${XTREAM_PROFILE:-default}"
 KIND="live"
@@ -220,7 +227,22 @@ THE USUAL JOB — A FILE FULL OF LINES
     plays, and the panel's own reason if it doesn't (a placeholder loop, a
     connection cap, a line barred from playback).
 
-  4 · Watch it before committing to it.
+  4 · Does it play smoothly, without you having to watch it?
+
+      xtream lines.txt smooth 'sky sports'          # whole dump, one command
+      xtream lines.txt -n 53 smooth 98              # or just this one line
+
+    check says it opens; smooth pulls it for a minute and reports whether the
+    video keeps pace with the clock. A feed that trickles decodes 20s of video
+    in 60s — on a TV that is constant buffering, and smooth calls it.
+
+    With no -n, smooth sweeps the dump like step 1 but confirms each hit with
+    the full minute instead of the instant probe — so it hands back a line
+    where the channel actually plays, ranked, with the TV login, in one go.
+    (Narrow with -z / -m / -C exactly as the sweep does; keep -j low when every
+    line is one panel.)
+
+  5 · Or watch it yourself.
 
       xtream lines.txt -n 53 play 98
       xtream lines.txt -n 53 play 'sky sports'      # a name works too
@@ -339,6 +361,13 @@ COMMANDS
                       left, and lists what survived best first, with the URL
                       to type into a TV
   check <ID|QUERY>    Probe the stream with ffprobe — is it really alive?
+  smooth <ID|QUERY>   Pull the stream for a minute and judge whether it plays
+                      without stuttering, instead of you watching it. Set the
+                      length with XTREAM_SMOOTH_SECS (default 60). Over a whole
+                      dump (no -n) it sweeps like `playable` but confirms each
+                      hit with the full test — one command to find a line where
+                      the channel really plays:
+                        xtream <dump> smooth 'tnt sports'
   counts [WHAT…]      How many live channels / movies / series the line
                       carries. Name what you want (live, movies, series) to
                       skip the catalogues you don't.
@@ -396,7 +425,8 @@ EXAMPLES
   xtream lines.txt -z london -m 'sky sports' playable uk    # 1. the sweep
   xtream lines.txt -n 53 search uk                # 2. what line 53 carries
   xtream lines.txt -n 53 check 98                 # 3. does that channel work
-  xtream lines.txt -n 53 play 98                  # 4. watch it
+  xtream lines.txt -n 53 smooth 98                # 4. does it play smoothly
+  xtream lines.txt -n 53 play 98                  # 5. or watch it yourself
   xtream lines.txt --stats status -o run.txt      # rank the whole dump instead
   xtream lines.txt history                        # what earlier runs found
   xtream lines.txt -s 7d playable uk              # …and don't ask them again
@@ -904,6 +934,9 @@ batch_autoscale() {
   if ((total <= 64)); then BATCH_CONCURRENCY=16
   elif ((total <= 512)); then BATCH_CONCURRENCY=32
   else BATCH_CONCURRENCY=48; fi
+  # A smooth sweep decodes each hit for a minute; a wide fan-out would peg the
+  # CPU on many HD decodes at once, so keep it narrow unless -j overrides.
+  [[ -n $SMOOTH_VERIFY ]] && ((BATCH_CONCURRENCY > 4)) && BATCH_CONCURRENCY=4
   ((BATCH_CONCURRENCY <= total)) || BATCH_CONCURRENCY=$total
 }
 
@@ -1045,7 +1078,7 @@ render_playable_row() {
 render_playable_detail() {
   local rank="$1" pos="$2"
   local u="${urls[$((pos - 1))]}" n="${idx[$((pos - 1))]}"
-  local out matches must sample exp cons tz epg user lead srv usr pw alias
+  local out matches must sample exp cons tz epg user lead srv usr pw alias sm
   user="$(batch_label "$u")"
   out="$(cat "$tmp/$pos.done" 2>/dev/null || true)"
   matches="$(sed -n 's/^matches *//p' <<<"$out")"
@@ -1055,6 +1088,7 @@ render_playable_detail() {
   cons="$(sed -n 's/^conns *//p' <<<"$out")"
   tz="$(sed -n 's/^tz *//p' <<<"$out")"
   epg="$(sed -n 's/^epg *//p' <<<"$out")"
+  sm="$(sed -n 's/^smooth *//p' <<<"$out")"
   srv="$(sed -n 's/^server *//p' <<<"$out")"
   alias="$(sed -n 's/^alias *//p' <<<"$out")"
   usr="$(sed -n 's/^user *//p' <<<"$out")"
@@ -1064,10 +1098,10 @@ render_playable_detail() {
   # found just says which line it is.
   if [[ -n $rank ]]; then lead="$(printf '%3d. ' "$rank")"; else lead="     "; fi
 
-  printf '%s%bline %d · %s%b  %s ch%s%s%s%s%s\n' \
+  printf '%s%bline %d · %s%b  %s ch%s%s%s%s%s%s\n' \
     "$lead" "$B" "$n" "$user" "$N" "${matches:-?}" \
-    "${must:+  must $must}" "${epg:+  epg $epg}" "${exp:+  exp $exp}" \
-    "${cons:+  conn $cons}" "${tz:+  $tz}"
+    "${must:+  must $must}" "${sm:+  ${G}$sm${N}}" "${epg:+  epg $epg}" \
+    "${exp:+  exp $exp}" "${cons:+  conn $cons}" "${tz:+  $tz}"
   printf '     %s%s%s\n' "$D" "$sample" "$N"
   printf '     %s\n' "$u"
   # Typing this into a TV is the last step, and the three fields are what it
@@ -1330,6 +1364,16 @@ cmd_batch() {
 
   [[ $sub != play ]] || die "play needs one line — pick it with -n N (see 'xtream $input lines')"
 
+  # Over a whole dump, `smooth QUERY` is a `playable QUERY` sweep that confirms
+  # each hit with the full continuity test instead of the instant probe — it
+  # finds a line where the channel actually plays without stuttering, in one
+  # command. The per-line workers read SMOOTH_VERIFY from the environment.
+  if [[ $sub == smooth ]]; then
+    SMOOTH_VERIFY=1
+    export XTREAM_SMOOTH_VERIFY=1
+    sub=playable
+  fi
+
   # --skip: most of a re-run over a stale dump is spent waiting on hosts that
   # were already gone last time. Drop those before a single request goes out.
   # Only dead and expired qualify — see history_note — and -r rechecks the lot.
@@ -1382,7 +1426,11 @@ cmd_batch() {
 
   local total=${#urls[@]}
   batch_autoscale "$total"
-  echo "${D}${total} line(s) · running '$sub' · ${BATCH_CONCURRENCY} at a time${JOBS_SET:+ (-j)}${N}"
+  # The banner names what was asked for — a smooth sweep runs as playable under
+  # the hood, but the user typed 'smooth'.
+  local sub_label="$sub"
+  [[ -n $SMOOTH_VERIFY ]] && sub_label="smooth (${SMOOTH_SECS}s each)"
+  echo "${D}${total} line(s) · running '$sub_label' · ${BATCH_CONCURRENCY} at a time${JOBS_SET:+ (-j)}${N}"
 
   # Run the lines concurrently, each into its own temp file, keeping the slots
   # topped up rather than waiting for a whole round to drain — one slow line
@@ -2149,6 +2197,11 @@ cmd_playable() {
   local q="${1:-}" list names row id name url matches purl sample
   local must_ok=0 must_total=0 missing="" tok
   local info st exp cons tz alias
+  local SM_MEDIA SM_WALL SM_RATIO SM_SPEED SM_DROPS SM_ERRS SM_VERDICT
+
+  # A smooth sweep confirms each hit with the full continuity test, so the
+  # worker needs ffmpeg just as `smooth` does.
+  [[ -n $SMOOTH_VERIFY ]] && need ffmpeg
 
   # One small request first. It says whether the line is alive, when it dies,
   # how many connections it allows and where the server thinks it lives — all
@@ -2256,25 +2309,43 @@ cmd_playable() {
     purl="${URL_OVERRIDE:-$XTREAM_HOST/get.php?username=$XTREAM_USER&password=$XTREAM_PASS&type=m3u_plus}"
   fi
 
-  if http_probe_stream "$url" "$id" quiet; then
-    echo "playable  yes"
+  # The instant HTTP probe is the cheap gate — it catches a 401/placeholder
+  # without pulling a frame.
+  if ! http_probe_stream "$url" "$id" quiet; then
+    echo "playable  no"
     echo "channel   $id  $name"
-    echo "url       $purl"
-    # A TV asks for server/username/password separately, which is a lot less
-    # typing on a remote than the whole URL — and these are decoded, so a
-    # password written %40 in the dump is the @ you actually have to type.
-    if [[ -z ${STALKER:-} ]]; then
-      echo "server    $XTREAM_HOST"
-      echo "user      $XTREAM_USER"
-      echo "pass      $XTREAM_PASS"
-      [[ -n ${alias:-} && ${XTREAM_HOST#*://} != "$alias" ]] && echo "alias     $alias"
-    fi
-    return 0
+    echo "reason    ${PROBE_REASON:-refused}"
+    return 1
   fi
-  echo "playable  no"
+
+  # A smooth sweep goes further: the panel can open a feed and then dribble it,
+  # which the instant probe can't see, so pull it for SMOOTH_SECS and judge
+  # whether it keeps pace. A stutterer is no more use than a refusal.
+  if [[ -n $SMOOTH_VERIFY ]]; then
+    smooth_probe "$url" "$id" || true
+    if [[ $SM_VERDICT != smooth && $SM_VERDICT != minor ]]; then
+      echo "playable  no"
+      echo "channel   $id  $name"
+      [[ $SM_VERDICT == dead ]] && echo "reason    no video" || echo "reason    stutters ${SM_RATIO}%"
+      return 1
+    fi
+  fi
+
+  echo "playable  yes"
   echo "channel   $id  $name"
-  echo "reason    ${PROBE_REASON:-refused}"
-  return 1
+  [[ -n $SMOOTH_VERIFY ]] &&
+    echo "smooth    ${SM_VERDICT} ${SM_SPEED} ${SM_MEDIA}/${SM_WALL}s ${SM_ERRS}err"
+  echo "url       $purl"
+  # A TV asks for server/username/password separately, which is a lot less
+  # typing on a remote than the whole URL — and these are decoded, so a
+  # password written %40 in the dump is the @ you actually have to type.
+  if [[ -z ${STALKER:-} ]]; then
+    echo "server    $XTREAM_HOST"
+    echo "user      $XTREAM_USER"
+    echo "pass      $XTREAM_PASS"
+    [[ -n ${alias:-} && ${XTREAM_HOST#*://} != "$alias" ]] && echo "alias     $alias"
+  fi
+  return 0
 }
 
 cmd_check() {
@@ -2354,6 +2425,163 @@ cmd_check() {
   rm -f "$errlog"
 }
 
+# Pull a stream for SMOOTH_SECS and measure whether it keeps pace with the
+# clock. Sets SM_MEDIA / SM_WALL / SM_RATIO / SM_SPEED / SM_DROPS / SM_ERRS and
+# SM_VERDICT (smooth | minor | choppy | dead); returns 0 when it is watchable
+# (smooth or minor), 1 otherwise. Prints nothing — the caller formats it — so
+# the single-line report and the sweep can share one measurement. The HTTP gate
+# (http_probe_stream) is the caller's job, done before this is reached.
+smooth_probe() {
+  local url="$1" id="$2"
+  local prog errlog pid guard start end heavy_errs=0
+
+  prog="$(mktemp "${TMPDIR:-/tmp}/xtream.XXXXXX")"
+  errlog="$(mktemp "${TMPDIR:-/tmp}/xtream.XXXXXX")"
+
+  # Decode the video (–an: skip audio, it's the picture that stutters) into the
+  # null muxer for SMOOTH_SECS of media, and have ffmpeg write machine-readable
+  # progress to its own file. -progress emits out_time/drop_frames/speed every
+  # second; we read the last line once it stops.
+  start="$(date +%s)"
+  set +e
+  ffmpeg -hide_banner -nostdin -nostats -loglevel error \
+    -rw_timeout "$((CONNECT_TIMEOUT * 1000000))" \
+    -i "$url" -t "$SMOOTH_SECS" -an -sn \
+    -f null -progress "$prog" - >/dev/null 2>"$errlog" &
+  pid=$!
+  # A source that dies mid-read could leave ffmpeg waiting past -t forever, so
+  # a watchdog kills it well after it should have finished on its own.
+  (
+    sleep "$((SMOOTH_SECS * 2 + 15))"
+    kill -INT "$pid" 2>/dev/null
+    sleep 3
+    kill -KILL "$pid" 2>/dev/null
+  ) &
+  guard=$!
+  wait "$pid"
+  set -e
+  kill "$guard" 2>/dev/null || true
+  wait "$guard" 2>/dev/null || true
+  end="$(date +%s)"
+
+  SM_WALL=$((end - start))
+  ((SM_WALL > 0)) || SM_WALL=1
+
+  # out_time is "HH:MM:SS.ffffff" — seconds of media decoded. Parsing the human
+  # field sidesteps the out_time_us / out_time_ms labelling that differs across
+  # ffmpeg builds.
+  # `|| true` on every grep: pipefail is on, so a progress file with no such
+  # line (a feed that delivered nothing) would fail the whole substitution and,
+  # under set -e, kill the run before it can report that — which is exactly the
+  # stream this is meant to catch.
+  SM_MEDIA="$({ grep '^out_time=' "$prog" 2>/dev/null || true; } | tail -1 | cut -d= -f2 |
+    awk -F: '{printf "%.0f", ($1*3600)+($2*60)+$3}')"
+  [[ $SM_MEDIA =~ ^[0-9]+$ ]] || SM_MEDIA=0
+  SM_DROPS="$({ grep '^drop_frames=' "$prog" 2>/dev/null || true; } | tail -1 | cut -d= -f2)"
+  [[ $SM_DROPS =~ ^[0-9]+$ ]] || SM_DROPS=0
+  # ffmpeg right-pads the speed field ("speed= 41x"), so strip the blanks.
+  SM_SPEED="$({ grep '^speed=' "$prog" 2>/dev/null || true; } | tail -1 | cut -d= -f2 | tr -d ' ')"
+  [[ -n $SM_SPEED && $SM_SPEED != N/A ]] || SM_SPEED="?"
+  # grep -c prints 0 AND exits non-zero on no matches — `|| true`, not
+  # `|| echo 0`, or the count becomes two lines and every (( … )) below it dies.
+  SM_ERRS="$(grep -c . "$errlog" 2>/dev/null || true)"
+  [[ $SM_ERRS =~ ^[0-9]+$ ]] || SM_ERRS=0
+  rm -f "$prog" "$errlog"
+
+  # Nothing of substance came through — the feed opened and then gave up.
+  if ((SM_MEDIA < 2)); then
+    SM_RATIO=0; SM_VERDICT=dead
+    return 1
+  fi
+
+  # Continuity is the main signal: the ratio of media decoded to wall time.
+  # 1.0 means it kept pace with the clock; well under means a TV would be
+  # buffering. A healthy live feed lands near 1.0, a touch over when the panel
+  # flushes a small buffer.
+  SM_RATIO="$(awk -v m="$SM_MEDIA" -v w="$SM_WALL" 'BEGIN{printf "%d", (m/w)*100}')"
+
+  # Decode errors only matter in bulk. A live .ts logs the odd corrupt packet
+  # even when the picture is fine — check() counts these as warnings, not
+  # death, and so does this. More than about one per second of video is real,
+  # visible break-up; a handful over a minute is noise.
+  ((SM_ERRS > SM_MEDIA)) && heavy_errs=1
+
+  if ((SM_RATIO >= 95)) && ((heavy_errs == 0)); then
+    SM_VERDICT=smooth; return 0
+  elif ((SM_RATIO >= 80)) && ((heavy_errs == 0)); then
+    SM_VERDICT=minor; return 0
+  else
+    SM_VERDICT=choppy; return 1
+  fi
+}
+
+# smooth <ID|QUERY> — does it actually play without stuttering?
+#
+# `check` proves a stream opens and names its codecs, but a panel can open a
+# feed and then dribble it, which is what makes a TV freeze and buffer. The
+# only way to know is to pull the stream for a while and see whether the media
+# keeps up with the clock. Over a whole dump (no -n) this is folded into the
+# `playable` sweep instead — see cmd_batch.
+#
+# Duration is XTREAM_SMOOTH_SECS (default 60) — a positional number would be
+# ambiguous with a channel id.
+cmd_smooth() {
+  need ffmpeg
+  [[ -n ${1:-} ]] || die "usage: xtream smooth <ID|QUERY>"
+
+  local id url
+  local SM_MEDIA SM_WALL SM_RATIO SM_SPEED SM_DROPS SM_ERRS SM_VERDICT
+
+  if [[ -n ${STALKER:-} ]]; then
+    id="$1"
+    url="$(stalker_run url "$1")" || exit 1
+  else
+    id="$(resolve_id "$1")" || exit 1
+    url="$(stream_url "$id")" || exit 1
+  fi
+
+  # Same cheap gate as check: catch a 401/placeholder/dead host before ffmpeg
+  # spends a minute on a stream the panel is simply refusing.
+  http_probe_stream "$url" "$id" || exit 1
+
+  # ${id} braced: a bare $id… folds the first byte of the multibyte ellipsis
+  # into the variable name, which trips set -u ("id…: unbound variable").
+  [[ -n $ISATTY ]] && echo "${D}sampling ${SMOOTH_SECS}s of stream ${id}…${N}" >&2
+
+  smooth_probe "$url" "$id" || true
+
+  case "$SM_VERDICT" in
+  smooth)
+    echo "${G}✓ stream $id plays smoothly${N}"
+    echo "  ${SM_MEDIA}s of video in ${SM_WALL}s real  ·  ${SM_SPEED}  ·  ${SM_DROPS} dropped  ·  ${SM_ERRS} decode error(s)"
+    echo "  ${D}keeps pace with real time — a TV would play this without buffering${N}"
+    ;;
+  minor)
+    echo "${Y}! stream $id mostly plays, with hitches${N}"
+    echo "  ${SM_MEDIA}s of video in ${SM_WALL}s real (${SM_RATIO}%)  ·  ${SM_SPEED}  ·  ${SM_DROPS} dropped  ·  ${SM_ERRS} decode error(s)"
+    echo "  ${D}slightly behind real time — the odd stutter, watchable${N}"
+    exit 1
+    ;;
+  dead)
+    echo "${R}✗ stream $id would not play${N}"
+    echo "  only ${SM_MEDIA}s of video in ${SM_WALL}s — the feed opened but delivered almost nothing"
+    exit 1
+    ;;
+  choppy)
+    echo "${R}✗ stream $id stutters${N}"
+    echo "  ${SM_MEDIA}s of video in ${SM_WALL}s real (${SM_RATIO}%)  ·  ${SM_SPEED}  ·  ${SM_DROPS} dropped  ·  ${SM_ERRS} decode error(s)"
+    # Say which failed: it either couldn't keep pace, or it kept pace but the
+    # picture is coming apart.
+    if ((SM_ERRS > SM_MEDIA)) && ((SM_RATIO >= 80)); then
+      echo "  ${D}decodes in time but the picture is breaking up — heavy corruption, bad on a TV${N}"
+    else
+      echo "  ${D}can't keep up with real time — it would buffer and freeze on a TV${N}"
+    fi
+    exit 1
+    ;;
+  esac
+}
+
 cmd_raw() {
   [[ -n ${1:-} ]] || die "usage: xtream raw <ACTION>"
   api "$1"
@@ -2426,6 +2654,7 @@ run_command() {
   url) cmd_url "${1:-}" ;;
   play) cmd_play "${1:-}" ;;
   check) cmd_check "${1:-}" ;;
+  smooth) cmd_smooth "${1:-}" ;;
   playable) cmd_playable "${1:-}" ;;
   epg) cmd_epg ;;
   counts) cmd_counts "$@" ;;
