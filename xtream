@@ -712,10 +712,12 @@ extract_xtream_urls() {
       next
     }
 
-    # (2b) host and credentials on the same row, as tab-separated tables put
-    # them: "http://host:80 <TAB> user : pass <TAB> UTC <TAB> Active …". The
-    # pair is looked for after the URL, which keeps the colon in a :8080 port
-    # out of the way, and MAC lines are left to the Stalker rule above.
+    # (2b) host and credentials on the same row, as a table puts them. Two
+    # shapes turn up:
+    #   colon-joined  "http://host:80   user : pass   UTC   Active …"
+    #   plain columns "http://host:80   user   pass   Región   Activa …"
+    # The credentials are looked for after the URL, which keeps the colon in a
+    # :8080 port out of the way, and MAC rows are left to the Stalker rule.
     line !~ /(get\.php|player_api\.php)/ &&
     line !~ /([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}/ &&
     match(line, /https?:\/\/[^][()[:space:]]+/) {
@@ -730,6 +732,22 @@ extract_xtream_urls() {
           emit(h "/get.php?username=" u "&password=" p "&type=m3u_plus")
           host = h
           next
+        }
+      } else {
+        # No colon: user and pass are the next two columns, set off from the
+        # host and each other by 2+ spaces. A single space is prose, not a
+        # table, so "see http://x for details" is never read as a line.
+        r2 = rest; sub(/^[ \t]+/, "", r2)
+        if (split(r2, cf, /[ \t][ \t]+/) >= 2) {
+          u = cf[1]; p = cf[2]
+          lu = tolower(u); lp = tolower(p)
+          if (!(lu ~ /^(usr|user|username|usuario|login|line)$/ ||
+                lp ~ /^(pw|pass|password|clave|contrasena|contraseña)$/) &&
+              u ~ /^[A-Za-z0-9._@+-]{2,}$/ && p ~ /^[A-Za-z0-9._@+-]{2,}$/) {
+            emit(h "/get.php?username=" u "&password=" p "&type=m3u_plus")
+            host = h
+            next
+          }
         }
       }
     }
